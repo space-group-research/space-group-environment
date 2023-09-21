@@ -1,8 +1,30 @@
 #!/usr/bin/bash
 
-echo "installing ..."
+# --- Determine Host System ---
+
+hostname=`hostname`
+
+if echo $hostname | grep --quiet "chem.ncsu.edu"
+then
+    hostsystem='chem'
+elif echo $hostname | grep --quiet "bridges2.psc.edu"
+then
+    hostsystem='bridges2'
+elif [ $hostname = 'login01' ] || [ $hostname = 'login02' ] || [ $hostname = 'login03' ] || [ $hostname = 'login04' ]
+then
+    hostsystem='hazel'
+else
+    hostsystem='unknown'
+fi
+
+echo "installing on $hostsystem ..."
 
 mkdir -p ~/bin
+
+if [ $hostsystem = 'hazel' ]
+then
+    gcc src/touch.c -o ~/bin/touch
+fi
 
 echo "~/pdb_wizard.py"
 cp src/pdb_wizard.py ~/bin
