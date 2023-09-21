@@ -33,9 +33,8 @@ then
     cp src/vmdrc ~/.vmdrc
 fi
 
-echo "reloading ~/.bashrc"
-source ~/.bashrc
-
 echo "done!"
+echo "you can reload your environment by running 'source ~/.bashrc'"
+echo "or opening a new terminal"
 
 
