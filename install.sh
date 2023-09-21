@@ -2,8 +2,13 @@
 
 echo "installing ..."
 
+mkdir -p ~/bin
+
 echo "~/pdb_wizard.py"
-cp src/pdb_wizard.py ~
+cp src/pdb_wizard.py ~/bin
+
+echo "gnuplot_runlog.sh"
+cp src/gnuplot_runlog.sh ~/bin
 
 echo "~/.spacebashrc"
 cp src/spacebashrc.sh ~/.spacebashrc

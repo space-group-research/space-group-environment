@@ -19,9 +19,13 @@ fi
 
 # --- Aliases ---
 
-# pdbwizard
-alias pdbwizard="python3 ~/pdb_wizard.py"
-alias pdb_wizard="python3 ~/pdb_wizard.py"
+# pdbwizard and other programs
+
+export PATH=$PATH:~/bin
+
+alias pdbwizard="python3 ~/bin/pdb_wizard.py"
+alias pdb_wizard="python3 ~/bin/pdb_wizard.py"
+alias plot='bash ~/bin/gnuplot_runlog.sh'
 
 # Easier navigation: .., ..., and ~
 alias ..="cd .."
@@ -69,8 +73,10 @@ then
 
     alias hazel="ssh login.hpc.ncsu.edu"
     alias bridges="ssh bridges2.psc.edu"
+    
     export CUDA_VISIBLE_DEVICES=0
     export OMP_NUM_THREADS=12
+    
     ulimit -s unlimited
     
 elif [ $hostsystem = 'bridges2' ]
@@ -78,10 +84,54 @@ then
 
     export WORK="/ocean/projects/che220043p"
     
+    bjobsdir() {
+        all_jobs=`squeue -u $USER | wc -l`
+        all_jobs=`echo "$all_jobs - 1" | bc`
+
+        for i in `squeue -u $USER | awk '{print $1}'| tail -$all_jobs`
+        do
+                dir=`scontrol show job $i| grep "WorkDir="`
+                echo $i $dir
+        done
+    }
+    
 elif [ $hostsystem = 'hazel' ]
 then
 
     export WORK="/share/ssp/$USER"
+    
+    # Print job ID and directory
+    bjobsdir()
+    {
+        job_id=`qstat -a | grep $USER | awk {'print $3'}`
+
+        for i in $job_id; do
+            job_dir=`echo $i | xargs bjobs -l | grep -A 1 "CWD" | head -n 2 | paste -d " " - - | grep -o "CWD <*[/a-zA-Z0-9.-\_]* *[/a-zA-Z0-9.-\_]*>" | sed "s/ //g" | sed "s/CWD//g" | sed "s/^<//g" | sed "s/>$//g"`
+            echo $i $job_dir
+        done
+    }
+
+    # Kill jobs located in current directory
+    bkill_here()
+    {
+        base=`pwd`
+        job_id=`bjobsdir | grep $base | awk {'print $1'}`
+
+        for i in $job_id; do
+            bkill $i
+        done
+    }
+
+    # Check jobs running in current directory
+    jobs_here()
+    {
+        base=`pwd`
+        job_id=`bjobsdir | grep $base | awk {'print $1'} | sort`
+
+        for i in $job_id; do
+            bjobs -w $i | grep $i | awk {'print $1, $4, $7'}
+        done
+    }
     
 fi
 
