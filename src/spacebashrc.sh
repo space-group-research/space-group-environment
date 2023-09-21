@@ -83,7 +83,9 @@ elif [ $hostsystem = 'bridges2' ]
 then
 
     export WORK="/ocean/projects/che220043p"
+    alias cdw='cd $WORK'
     
+    # Print job ID and directory
     bjobsdir() {
         all_jobs=`squeue -u $USER | wc -l`
         all_jobs=`echo "$all_jobs - 1" | bc`
@@ -99,6 +101,13 @@ elif [ $hostsystem = 'hazel' ]
 then
 
     export WORK="/share/ssp/$USER"
+    export LSB_BJOBS_FORMAT="id user queue:6 stat:4 exec_host:8 job_name:30 submit_time start_time"
+    alias cdw='cd $WORK'
+    alias wjobs='bjobs -w'
+    alias memory='bjobs -r -X -o "jobid queue cpu_used run_time avg_mem max_mem slots "'
+    alias space='qstat -a space'
+    alias job_count='qstat -a | grep -c $USER'
+    alias touch=~/bin/touch
     
     # Print job ID and directory
     bjobsdir()
