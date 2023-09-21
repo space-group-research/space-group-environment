@@ -23,6 +23,7 @@ mkdir -p ~/bin
 
 if [ $hostsystem = 'hazel' ]
 then
+    echo "~/bin/touch"
     gcc src/touch.c -o ~/bin/touch
 fi
 
