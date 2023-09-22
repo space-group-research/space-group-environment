@@ -1,5 +1,8 @@
 #!/usr/bin/bash
 
+# --- Exit early if not interactive ---
+[[ $- == *i* ]] || return
+
 # --- Determine Host System ---
 
 hostname=`hostname`
