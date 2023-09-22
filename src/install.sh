@@ -36,7 +36,15 @@ echo "~/.spacebashrc"
 cp src/spacebashrc.sh ~/.spacebashrc
 
 echo "entry"
-cp src/entry/* ~/bin/entry
+cp src/entry/ae.sh ~/bin/entry
+cp src/entry/ce.sh ~/bin/entry
+cp src/entry/ne.sh ~/bin/entry
+cp src/entry/ue.sh ~/bin/entry
+cp src/entry/READ_ME.txt ~/bin/entry
+if ! [ -f ~/bin/entry/var_storage.sh ]
+then
+    cp src/entry/var_storage.sh ~/bin/entry
+fi
 
 if ! grep --quiet "source ~/.spacebashrc" ~/.bashrc
 then
