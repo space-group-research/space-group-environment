@@ -108,13 +108,57 @@ ae() { #Compile all entries into one file
 if [ $hostsystem = 'chem' ]
 then
 
-    alias hazel="ssh login.hpc.ncsu.edu"
-    alias bridges="ssh bridges2.psc.edu"
+    if [ `alias | grep "alias hazel=" | wc -l` = 0 ]
+    then
+        alias hazel="ssh login.hpc.ncsu.edu"
+    fi
+    if [ `alias | grep "alias bridges=" | wc -l` = 0 ]
+    then
+        alias bridges="ssh bridges2.psc.edu"
+    fi
     
     export CUDA_VISIBLE_DEVICES=0
     export OMP_NUM_THREADS=12
     
     ulimit -s unlimited
+    
+    play() {
+        xdg-open $1
+    }
+    
+    open() {
+        xdg-open $1
+    }
+
+    fromhazel(){
+        scp -r cjsolani@login.hpc.ncsu.edu:$1 ./new
+        mv new/* ./
+        rm -r new/
+    }
+
+    tohazel(){
+        echo "Enter path: "
+        read destination
+        scp -r $1 cjsolani@login.hpc.ncsu.edu:$destination/$1
+    }
+
+    tobridges2(){
+        echo "Enter path: "
+        read destination
+        scp -r $1 solanill@bridges2.psc.edu:$destination/$1
+    }
+
+    update_hazel(){
+        printf "Enter path on Hazel to sync to CURRENT directory:\n%s\n" `pwd`
+        read source_path
+        rsync -avh cjsolani@login.hpc.ncsu.edu:$source_path/* .
+    }
+
+    update_bridges(){
+        printf "Enter path on Bridges2 to sync to CURRENT directory:\n%s\n" `pwd`
+        read source_path
+        rsync -avh solanill@bridges2.psc.edu:$source_path/ .
+    }
     
 elif [ $hostsystem = 'bridges2' ]
 then
@@ -177,44 +221,6 @@ then
         for i in $job_id; do
             bjobs -w $i | grep $i | awk {'print $1, $4, $7'}
         done
-    }
-    
-    play() {
-        xdg-open $1
-    }
-    
-    open() {
-        xdg-open $1
-    }
-
-    fromhazel(){
-        scp -r cjsolani@login.hpc.ncsu.edu:$1 ./new
-        mv new/* ./
-        rm -r new/
-    }
-
-    tohazel(){
-        echo "Enter path: "
-        read destination
-        scp -r $1 cjsolani@login.hpc.ncsu.edu:$destination/$1
-    }
-
-    tobridges2(){
-        echo "Enter path: "
-        read destination
-        scp -r $1 solanill@bridges2.psc.edu:$destination/$1
-    }
-
-    update_hazel(){
-        printf "Enter path on Hazel to sync to CURRENT directory:\n%s\n" `pwd`
-        read source_path
-        rsync -avh cjsolani@login.hpc.ncsu.edu:$source_path/* .
-    }
-
-    update_bridges(){
-        printf "Enter path on Bridges2 to sync to CURRENT directory:\n%s\n" `pwd`
-        read source_path
-        rsync -avh solanill@bridges2.psc.edu:$source_path/ .
     }
     
 fi
