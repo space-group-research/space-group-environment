@@ -20,6 +20,7 @@ fi
 echo "installing on $hostsystem ..."
 
 mkdir -p ~/bin
+mkdir -p ~/bin/entry
 
 if [ $hostsystem = 'hazel' ]
 then
@@ -35,6 +36,9 @@ cp src/gnuplot_runlog.sh ~/bin
 
 echo "~/.spacebashrc"
 cp src/spacebashrc.sh ~/.spacebashrc
+
+echo "entry"
+cp src/entry/* ~/bin/entry
 
 if ! grep --quiet "source ~/.spacebashrc" ~/.bashrc
 then

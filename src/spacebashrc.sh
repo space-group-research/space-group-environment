@@ -17,6 +17,8 @@ else
     hostsystem='unknown'
 fi
 
+export hostsystem
+
 # --- Aliases ---
 
 # pdbwizard and other programs
@@ -65,6 +67,35 @@ export MANPAGER="less -X"
 # Make new shells get the history lines from all previous
 # shells instead of the default "last window closed" history
 export PROMPT_COMMAND="history -a; $PROMPT_COMMAND"
+
+#ENTRY COMMANDS
+entry_path=~/bin/entry
+alias cdentry='cd ~/bin/entry'
+
+ce() { #Create Entry
+        export entry_path
+        sh $entry_path/var_storage.sh
+        sh $entry_path/ce.sh
+}
+
+ue() { #Update Entry
+        export entry_path
+        sh $entry_path/var_storage.sh
+        sh $entry_path/ue.sh
+}
+
+ne() { #Notate Entry
+        export entry_path
+        sh $entry_path/var_storage.sh
+        sh $entry_path/ne.sh
+}
+
+ae() { #Compile all entries into one file
+        export entry_path
+        sh $entry_path/var_storage.sh
+        sh $entry_path/ae.sh
+}
+
 
 # --- System Specific Exports ---
 
