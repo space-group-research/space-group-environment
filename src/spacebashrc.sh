@@ -31,6 +31,8 @@ export PATH=$PATH:~/bin
 alias pdbwizard="python3 ~/bin/pdb_wizard.py"
 alias pdb_wizard="python3 ~/bin/pdb_wizard.py"
 alias plot='bash ~/bin/gnuplot_runlog.sh'
+alias bashrc='vim ~/.bashrc'
+alias bashup='source ~/.bashrc'
 
 # Easier navigation: .., ..., and ~
 alias ..="cd .."
@@ -40,6 +42,7 @@ alias ~="cd ~"
 # List dir contents aliases
 # ref: http://ss64.com/osx/ls.html
 # Long form no user group, color
+alias ls="ls --color=auto"
 alias l="ls -oG"
 # Order by last modified, long form no user group, color
 alias lt="ls -toG"
@@ -174,6 +177,44 @@ then
         for i in $job_id; do
             bjobs -w $i | grep $i | awk {'print $1, $4, $7'}
         done
+    }
+    
+    play() {
+        xdg-open $1
+    }
+    
+    open() {
+        xdg-open $1
+    }
+
+    fromhazel(){
+        scp -r cjsolani@login.hpc.ncsu.edu:$1 ./new
+        mv new/* ./
+        rm -r new/
+    }
+
+    tohazel(){
+        echo "Enter path: "
+        read destination
+        scp -r $1 cjsolani@login.hpc.ncsu.edu:$destination/$1
+    }
+
+    tobridges2(){
+        echo "Enter path: "
+        read destination
+        scp -r $1 solanill@bridges2.psc.edu:$destination/$1
+    }
+
+    update_hazel(){
+        printf "Enter path on Hazel to sync to CURRENT directory:\n%s\n" `pwd`
+        read source_path
+        rsync -avh cjsolani@login.hpc.ncsu.edu:$source_path/* .
+    }
+
+    update_bridges(){
+        printf "Enter path on Bridges2 to sync to CURRENT directory:\n%s\n" `pwd`
+        read source_path
+        rsync -avh solanill@bridges2.psc.edu:$source_path/ .
     }
     
 fi
