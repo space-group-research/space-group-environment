@@ -532,7 +532,7 @@ then
 
 fi
 #@---------------------------------------------------------ORCA--------------------------------------------------------@
-if [ $program == "ORCA" ] ;
+if [ "$program" == "ORCA" ] ;
 then
 #BUILD VARIABLES - ORCA
     #Inp variables
