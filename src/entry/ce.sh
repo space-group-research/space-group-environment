@@ -109,32 +109,79 @@ echo -e "@--------------------------------------------------@"
     increment_entry_num=$(($entry_number+1))
 
 #Check What Program Is Used
+if [ -f *.inp ] ;
+then
 check=`head -n 1 *.inp | awk '{print $1}'`
 
-if grep -q "&GLOBAL" *.inp || grep -q "&GLOBAL" *-1.restart &> /dev/null ; #assuming all cp2k *.inp files start with &GLOBAL
-then
-        echo -e "${bold}You are using CP2K${reset}"
-    program="CP2K" 
+        if grep -q "&GLOBAL" *.inp || grep -q "&GLOBAL" *-1.restart &> /dev/null ; #assuming all cp2k *.inp files start with &GLOBAL
+        then
+                echo -e "${bold}You are using CP2K${reset}"
+                program="CP2K"
 
-elif grep  "job_name" *.inp &> /dev/null ; #assuming all mpmc *.inp files contains 'job_name'
-then
-        echo -e "${bold}You are using MPMC.${reset}"
-        program="MPMC"
+        elif grep  "job_name" *.inp &> /dev/null ; #assuming all mpmc *.inp files contains 'job_name'
+        then
+                echo -e "${bold}You are using MPMC.${reset}"
+                program="MPMC"
 
-elif grep "import openmm" *.py &> /dev/null || grep "import openff" *.py &> /dev/null ; #assuming all open mm jobs have a *.py file with 'import openmm'
-then
-        echo -e "${bold}You are using OPENMM.${reset}"
-        program="OPENMM"
+        elif grep "import openmm" *.py &> /dev/null || grep "import openff" *.py &> /dev/null ; #assuming all open mm jobs have a *.py file with 'import openmm'
+        then
+                echo -e "${bold}You are using OPENMM.${reset}"
+                program="OPENMM"
 
-elif [ "$check" = "!" ] ; #assuming all ORCA *.inp files start with '!'
-then
-    echo -e "${bold}You are using ORCA.${reset}"
-    program="ORCA"
+        elif [ "$check" = "!" ] ; #assuming all ORCA *.inp files start with '!'
+        then
+                echo -e "${bold}You are using ORCA.${reset}"
+                program="ORCA"
+        else
+                echo -e "${bold}${magenta}*.inp file found, but cannot detect a program in list of default programs. Writing basic entry.${reset}"
+                program="No program detected."
+        fi
+else
+        echo -e "${bold}${cyan}No *.inp file found. Writing basic entry.${reset}"
+        program="No program detected."
 fi
 
-
-
 #--------------------------------------------------------------------------------------------------------------------BUILD PROGRAM-UNIQUE ENTRIES
+if [ "$program" == "No program detected." ] ;
+then
+
+#WRITE ENTRY - No Program Detected
+    #Introduction
+    #Titles are 36 -, four spaces between words.
+    echo -e "\n\n\n\n" > entry.txt
+    echo -e "________________________________________________________________\nENTRY # $entry_number$index\n" >> entry.txt
+    echo -e "@------------------------------------@\n      E N T R Y    D E T A I L S\n@------------------------------------@" >> entry.txt
+    echo -e "By: " $user >> entry.txt
+    echo -e "Date of Entry (DD/MM/YYYY HR:MIN:SEC): " $dt >> entry.txt
+    echo -e "Working Directory: "$dir >> entry.txt
+    echo -e "Program | Version: " $program >> entry.txt
+    if [[ $description == "1" ]]
+    then
+        echo -e "Description: " $previous_description >> entry.txt
+    else
+        echo -e "Description: " $description >> entry.txt
+    fi
+    echo -e "\n" >> entry.txt
+
+    #System Details
+    echo -e "@------------------------------------@\n   M A T E R I A L    D E T A I L S\n@------------------------------------@" >> entry.txt
+
+    if [[ $material == "1" ]]
+    then
+        echo "Material: " $default_material >> entry.txt
+    else
+        echo -e "Material: " $material >> entry.txt
+    fi
+
+    if test -z $gas;
+    then
+        echo "Gas Loading: None." >> entry.txt
+    else
+        echo "Gas Loading: " $gas ',' $concentration >> entry.txt
+    fi
+    echo -e "\n" >> entry.txt
+
+fi
 
 #@---------------------------------------------------------CP2K--------------------------------------------------------@
 
