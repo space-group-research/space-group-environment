@@ -22,6 +22,12 @@ program=`grep "Program |" entry.txt | awk '{print $4}'`
 
 
 #-------------------------------------------------------------------------------------------------------------BUILD VARIABLES BASED ON PROGRAM
+
+if [ "$program" == "No" ] ;
+then
+        echo -e "${bold}${red}There is no program detected, so there is nothing to update. If desired, you may customize your own entry update in the ue.sh script using the Open MM section as a template.${reset}"
+fi
+
 #@---------------------------------------------------------CP2K--------------------------------------------------------@
 
 if [ "$program" == "CP2K" ] ;
