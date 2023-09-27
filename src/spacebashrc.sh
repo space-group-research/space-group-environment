@@ -131,7 +131,7 @@ then
     }
 
     fromhazel(){
-        scp -r cjsolani@login.hpc.ncsu.edu:$1 ./new
+        scp -r $USER@login.hpc.ncsu.edu:$1 ./new
         mv new/* ./
         rm -r new/
     }
@@ -139,25 +139,25 @@ then
     tohazel(){
         echo "Enter path: "
         read destination
-        scp -r $1 cjsolani@login.hpc.ncsu.edu:$destination/$1
+        scp -r $1 $USER@login.hpc.ncsu.edu:$destination/$1
     }
 
     tobridges2(){
         echo "Enter path: "
         read destination
-        scp -r $1 solanill@bridges2.psc.edu:$destination/$1
+        scp -r $1 $USER@bridges2.psc.edu:$destination/$1
     }
 
     update_hazel(){
         printf "Enter path on Hazel to sync to CURRENT directory:\n%s\n" `pwd`
         read source_path
-        rsync -avh cjsolani@login.hpc.ncsu.edu:$source_path/* .
+        rsync -avh $USER@login.hpc.ncsu.edu:$source_path/* .
     }
 
     update_bridges(){
         printf "Enter path on Bridges2 to sync to CURRENT directory:\n%s\n" `pwd`
         read source_path
-        rsync -avh solanill@bridges2.psc.edu:$source_path/ .
+        rsync -avh $USER@bridges2.psc.edu:$source_path/ .
     }
     
 elif [ $hostsystem = 'bridges2' ]
