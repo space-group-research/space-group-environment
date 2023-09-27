@@ -55,31 +55,31 @@ fi
 
 if [ $x_axis == 6 ] ;
 then
-        grep "Potential energy" runlog.log | awk '{printf $5 "\n"}' > x_axis.txt
+        grep "Potential energy" runlog.log | grep -v "MD_INI" | grep -v "MD_PAR" | awk '{printf $5 "\n"}' > x_axis.txt
 	x_label="Potential Energy [hartree]"
 fi
 
 if [ $x_axis == 7 ] ;
 then
-        grep "Kinetic energy" runlog.log | awk '{printf $5 "\n"}' > x_axis.txt
+        grep "Kinetic energy" runlog.log | grep -v "MD_INI" | grep -v "MD_PAR" | awk '{printf $5 "\n"}' > x_axis.txt
 	x_label="Kinetic Energy [hartree]"
 fi
 
 if [ $x_axis == 8 ] ;
 then
-	grep "Temperature" runlog.log | awk '{printf $4 "\n"}' > x_axis.txt
+	grep "Temperature" runlog.log | grep -v "MD_INI" | grep -v "MD_PAR" | awk '{printf $4 "\n"}' > x_axis.txt
 	x_label="Instantaneous Temperature [K]"
 fi
 
 if [ $x_axis == 9 ] ;
 then
-	grep "Temperature" runlog.log | awk '{printf $5 "\n"}' > x_axis.txt
+	grep "Temperature" runlog.log | grep -v "MD_INI" | grep -v "MD_PAR" | awk '{printf $5 "\n"}' > x_axis.txt
 	x_label="Average Temperature [K]"
 fi
 
 if [ $x_axis == 10 ] ;
 then
-        grep "Pressure" runlog.log | awk '{printf $4 "\n"}' > x_axis.txt
+        grep "Pressure" runlog.log | grep -v "MD_INI" | grep -v "MD_PAR" | awk '{printf $4 "\n"}' > x_axis.txt
 	x_label="Pressure [bar]"
 fi
 
@@ -116,31 +116,31 @@ fi
 
 if [ $y_axis == 6 ] ;
 then
-        grep "Potential energy" runlog.log | awk '{printf $5 "\n"}' > y_axis.txt
+        grep "Potential energy" runlog.log | grep -v "MD_INI" | grep -v "MD_PAR" | awk '{printf $5 "\n"}' > y_axis.txt
         y_label="Potential Energy [hartree]"
 fi
 
 if [ $y_axis == 7 ] ;
 then
-        grep "Kinetic energy" runlog.log | awk '{printf $5 "\n"}' > y_axis.txt
+        grep "Kinetic energy" runlog.log | grep -v "MD_INI" | grep -v "MD_PAR" | awk '{printf $5 "\n"}' > y_axis.txt
         y_label="Kinetic Energy [hartree]"
 fi
 
 if [ $y_axis == 8 ] ;
 then
-	grep "Temperature" runlog.log | awk '{printf $4 "\n"}' > y_axis.txt
+	grep "Temperature" runlog.log | grep -v "MD_INI" | grep -v "MD_PAR" | awk '{printf $4 "\n"}' > y_axis.txt
 	y_label="Instantaneous Temperature [K]"
 fi
 
 if [ $y_axis == 9 ] ;
 then
-	grep "Temperature" runlog.log | awk '{printf $5 "\n"}' > y_axis.txt
+	grep "Temperature" runlog.log | grep -v "MD_INI" | grep -v "MD_PAR" | awk '{printf $5 "\n"}' > y_axis.txt
 	y_label="Average Temperature [K]"
 fi
 
 if [ $y_axis == 10 ] ;
 then
-        grep "Pressure" runlog.log | awk '{printf $4 "\n"}' > y_axis.txt
+        grep "Pressure" runlog.log | grep -v "MD_INI" | grep -v "MD_PAR" | awk '{printf $4 "\n"}' > y_axis.txt
         y_label="Pressure [bar]"
 fi
 
