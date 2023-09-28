@@ -253,8 +253,8 @@ element_masses = {
 
 class Atom:
     def __init__(self, x, y, z, name):
-        self.name = name.strip()
-        self.x = array([float(x), float(y), float(z)])
+        self.name: str = str(name).strip()
+        self.x: np.ndarray = array([float(x), float(y), float(z)])
         element = "".join([i for i in self.name[:2] if i.isalpha()])
         element = element.lower().capitalize()
 
@@ -263,6 +263,8 @@ class Atom:
             if element not in list_of_elements:
                 print("!!! Invalid element {} !!!".format(name))
 
+        self.bond_r: float
+        self.vdw: float
         if element == "H":
             self.bond_r = 0.8
             self.vdw = 1.2
@@ -276,16 +278,16 @@ class Atom:
             self.bond_r = 2.0
             self.vdw = 3.0
 
-        self.element = element
-        self.charge = 0.0
-        self.alpha = 0.0
-        self.epsilon = 0.0
-        self.sigma = 0.0
-        self.c6 = 0.0
-        self.c8 = 0.0
-        self.c10 = 0.0
-        self.mass = element_masses[self.element]
-        self.id = 0
+        self.element: str = element
+        self.charge: float = 0.0
+        self.alpha: float = 0.0
+        self.epsilon: float = 0.0
+        self.sigma: float = 0.0
+        self.c6: float = 0.0
+        self.c8: float = 0.0
+        self.c10: float = 0.0
+        self.mass: float = element_masses[self.element]
+        self.id: int = 0
 
     def __str__(self):
         return "Atom instance {} {}".format(self.element, self.id)
@@ -794,7 +796,6 @@ def read_xyz(system, filename):
 
     try:
         for line in progressbar(file.readlines(), "Reading file {} ".format(filename)):
-
             # ignore blank lines
             if line == "" or line == "\n":
                 continue
@@ -1011,12 +1012,23 @@ def write_standard_pdb(system, pbc, filename):
 
     atom_id = 1
     for idx, mol in enumerate(mols):
-
         mol.sort(key=lambda atom: atom.element)
         mol_name = "UNK"
         mol_elements = [atom.element for atom in mol]
         if mol_elements == ["H", "H", "O"]:
             mol_name = "HOH"
+        elif mol_elements == ["H", "H"]:
+            mol_name = "H2"
+        elif mol_elements == ["H", "H", "H", "H", "C"]:
+            mol_name = "MET"
+        elif mol_elements == ["N", "N"]:
+            mol_name = "N2"
+        elif mol_elements == ["H", "H", "C", "C"]:
+            mol_name = "ACE"
+        elif mol_elements == ["H", "H", "H", "H", "C", "C"]:
+            mol_name = "ENE"
+        elif mol_elements == ["H", "H", "H", "H", "H", "H", "C", "C"]:
+            mol_name = "ETH"
         elif mol_elements == ["He"]:
             mol_name = "HE"
         elif mol_elements == ["Ne"]:
@@ -1069,7 +1081,6 @@ def write_standard_pdb(system, pbc, filename):
             additional_tag += 1
 
     for idx, mol in enumerate(mols):
-
         mol.sort(key=lambda atom: atom.element)
 
         mol_elements = [atom.element for atom in mol]
@@ -1127,7 +1138,6 @@ def find_molecules(system, pbc):
 def apply_ff_to_system(system, ff):
     for atom in system:
         try:
-            atom.mass = ff[atom.element]["mass"]
             atom.alpha = ff[atom.element]["alpha"]
             atom.epsilon = ff[atom.element]["epsilon"]
             atom.sigma = ff[atom.element]["sigma"]
@@ -1140,6 +1150,12 @@ def apply_ff_to_system(system, ff):
                     atom.element
                 )
             )
+            atom.alpha = 0.0
+            atom.epsilon = 0.0
+            atom.sigma = 0.0
+            atom.c6 = 0.0
+            atom.c8 = 0.0
+            atom.c10 = 0.0
 
 
 def write_mpmc_pdb(system, pbc, filename, write_charges=False, write_params=False):
@@ -1297,6 +1313,20 @@ def print_formula_unit(system):
     print("\nFormula unit\n")
     for ele in atom_dict:
         print("{} {}".format(ele, int(atom_dict[ele] / atoms_gcd)))
+
+
+def sort(system, pbc):
+    mols = find_molecules(system, pbc)
+    for idx, mol in enumerate(mols):
+        mol.sort(key=lambda atom: atom.element)
+    mols.sort(key=lambda mol: mol[0].element)
+    mols.sort(key=lambda mol: len(mol), reverse=True)
+    mols.sort(key=lambda mol: 0 if np.max([atom.mass for atom in mol]) > 16 else 1)
+    system = []
+    for mol in mols:
+        for atom in mol:
+            system.append(atom)
+    return system
 
 
 def wrapall_forward(system, pbc):
@@ -1596,8 +1626,28 @@ def geom_analysis(system, pbc):
             return
 
 
-def main_loop():
+def update_pbc(pbc):
+    while True:
+        try:
+            a = input("Enter cell information\na>     ")
+            a = float(a)
+            b = input("b>     ")
+            b = float(b)
+            c = input("c>     ")
+            c = float(c)
+            alpha = input("alpha> ")
+            alpha = float(alpha)
+            beta = input("beta>  ")
+            beta = float(beta)
+            gamma = input("gamma> ")
+            gamma = float(gamma)
+            break
+        except ValueError:
+            print("!!! Error converting input to float !!!\n")
+    pbc.update(a, b, c, alpha, beta, gamma)
 
+
+def main_loop():
     if len(sys.argv) != 2:
         sys.exit("Usage: python3 pdb_wizard.py <filename.[xyz|pdb]>")
 
@@ -1648,11 +1698,12 @@ def main_loop():
                 2 = extend along axis\n\
                 3 = wrap atoms from (0, 0, 0) to (1, 1, 1)\n\
                 4 = wrap atoms from (-1/2, -1/2, -1/2) to (1/2, 1/2, 1/2)\n\
-                5 = update cell dimensions\n\
-                6 = write .xyz\n\
-                7 = write MPMC .pdb\n\
-                8 = write standardized .pdb\n\
-                9 = quit\n\n> "
+                5 = sort atoms\n\
+                6 = update cell dimensions\n\
+                7 = write .xyz\n\
+                8 = write MPMC .pdb\n\
+                9 = write standardized .pdb\n\
+                0 = quit\n\n> "
             )
             option = int(option)
         except ValueError:
@@ -1666,33 +1717,18 @@ def main_loop():
         elif option == 4:
             wrapall(system, pbc)
         elif option == 5:
-            while True:
-                try:
-                    a = input("Enter cell information\na>     ")
-                    a = float(a)
-                    b = input("b>     ")
-                    b = float(b)
-                    c = input("c>     ")
-                    c = float(c)
-                    alpha = input("alpha> ")
-                    alpha = float(alpha)
-                    beta = input("beta>  ")
-                    beta = float(beta)
-                    gamma = input("gamma> ")
-                    gamma = float(gamma)
-                    break
-                except ValueError:
-                    print("!!! Error converting input to float !!!\n")
-            pbc.update(a, b, c, alpha, beta, gamma)
+            system = sort(system, pbc)
         elif option == 6:
+            update_pbc(pbc)
+        elif option == 7:
             filename = input("\noutput filename > ")
             write_xyz(system, pbc, filename)
-        elif option == 7:
-            write_mpmc_options(system, pbc)
         elif option == 8:
+            write_mpmc_options(system, pbc)
+        elif option == 9:
             filename = input("\noutput filename > ")
             write_standard_pdb(system, pbc, filename)
-        elif option == 9:
+        elif option == 0:
             break
         else:
             print("\nInvalid option!")
@@ -1700,3 +1736,4 @@ def main_loop():
 
 if __name__ == "__main__":
     main_loop()
+    exit(0)
