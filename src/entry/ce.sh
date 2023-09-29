@@ -109,7 +109,7 @@ echo -e "@--------------------------------------------------@"
     increment_entry_num=$(($entry_number+1))
 
 #Check What Program Is Used
-if [ -f *.inp ] ;
+if [ -f *.inp ] || [ -f *-1.restart ] ;
 then
 check=`head -n 1 *.inp | awk '{print $1}'`
 
