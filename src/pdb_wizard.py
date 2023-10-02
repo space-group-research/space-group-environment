@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 #
-# PDB Wizard v0.3.0
-# copyright Adam Hogan 2021-2022
+# PDB Wizard v0.3.1
+# copyright Adam Hogan 2021-2023
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -18,13 +18,15 @@
 #
 
 import copy
+import io
 import os
 import sys
+from typing import TextIO, Iterable, Iterator
 
 import numpy as np
 from numpy import array, cos, pi, sin, sqrt
 
-list_of_elements = [
+list_of_elements: list[str] = [
     "Ac",
     "Ag",
     "Al",
@@ -137,7 +139,7 @@ list_of_elements = [
     "Da",
 ]
 
-element_masses = {
+element_masses: dict[str, float] = {
     "H": 1.00797,
     "He": 4.0026,
     "Li": 6.941,
@@ -250,21 +252,157 @@ element_masses = {
     "Da": 0,
 }
 
+atomic_numbers: dict[str, int] = {
+    "H": 1,
+    "He": 2,
+    "Li": 3,
+    "Be": 4,
+    "B": 5,
+    "C": 6,
+    "N": 7,
+    "O": 8,
+    "F": 9,
+    "Ne": 10,
+    "Na": 11,
+    "Mg": 12,
+    "Al": 13,
+    "Si": 14,
+    "P": 15,
+    "S": 16,
+    "Cl": 17,
+    "Ar": 18,
+    "K": 19,
+    "Ca": 20,
+    "Sc": 21,
+    "Ti": 22,
+    "V": 23,
+    "Cr": 24,
+    "Mn": 25,
+    "Fe": 26,
+    "Co": 27,
+    "Ni": 28,
+    "Cu": 29,
+    "Zn": 30,
+    "Ga": 31,
+    "Ge": 32,
+    "As": 33,
+    "Se": 34,
+    "Br": 35,
+    "Kr": 36,
+    "Rb": 37,
+    "Sr": 38,
+    "Y": 39,
+    "Zr": 40,
+    "Nb": 41,
+    "Mo": 42,
+    "Tc": 43,
+    "Ru": 44,
+    "Rh": 45,
+    "Pd": 46,
+    "Ag": 47,
+    "Cd": 48,
+    "In": 49,
+    "Sn": 50,
+    "Sb": 51,
+    "Te": 52,
+    "I": 53,
+    "Xe": 54,
+    "Cs": 55,
+    "Ba": 56,
+    "La": 57,
+    "Ce": 58,
+    "Pr": 59,
+    "Nd": 60,
+    "Pm": 61,
+    "Sm": 62,
+    "Eu": 63,
+    "Gd": 64,
+    "Tb": 65,
+    "Dy": 66,
+    "Ho": 67,
+    "Er": 68,
+    "Tm": 69,
+    "Yb": 70,
+    "Lu": 71,
+    "Hf": 72,
+    "Ta": 73,
+    "W": 74,
+    "Re": 75,
+    "Os": 76,
+    "Ir": 77,
+    "Pt": 78,
+    "Au": 79,
+    "Hg": 80,
+    "Tl": 81,
+    "Pb": 82,
+    "Bi": 83,
+    "Po": 84,
+    "At": 85,
+    "Rn": 86,
+    "Fr": 87,
+    "Ra": 88,
+    "Ac": 89,
+    "Th": 90,
+    "Pa": 91,
+    "U": 92,
+    "Np": 93,
+    "Pu": 94,
+    "Am": 95,
+    "Cm": 96,
+    "Bk": 97,
+    "Cf": 98,
+    "Es": 99,
+    "Fm": 100,
+    "Md": 101,
+    "No": 102,
+    "Lr": 103,
+    "Rf": 104,
+    "Db": 105,
+    "Sg": 106,
+    "Bh": 107,
+    "Hs": 108,
+    "Mt": 109,
+    "Ds": 110,
+    "Rg": 111,
+    "Cn": 112,
+    "Nh": 113,
+    "Fl": 114,
+    "Mc": 115,
+    "Lv": 116,
+    "Ts": 117,
+    "Og": 118,
+    "Da": 0,
+}
+
 
 class Atom:
-    def __init__(self, x, y, z, name):
-        self.name: str = str(name).strip()
-        self.x: np.ndarray = array([float(x), float(y), float(z)])
+    name: str
+    element: str
+    x: np.ndarray
+    bond_r: float
+    vdw: float
+    charge: float
+    alpha: float
+    epsilon: float
+    sigma: float
+    c6: float
+    c8: float
+    c10: float
+    mass: float
+    atomic_number: int
+    id: int
+
+    def __init__(self, x, y, z, name) -> None:
+        self.name = str(name).strip()
+        self.x = array([float(x), float(y), float(z)])
         element = "".join([i for i in self.name[:2] if i.isalpha()])
         element = element.lower().capitalize()
 
         if element not in list_of_elements:
             element = element[0]
             if element not in list_of_elements:
-                print("!!! Invalid element {} !!!".format(name))
+                print(f"!!! Invalid element {name} !!!")
 
-        self.bond_r: float
-        self.vdw: float
         if element == "H":
             self.bond_r = 0.8
             self.vdw = 1.2
@@ -278,23 +416,36 @@ class Atom:
             self.bond_r = 2.0
             self.vdw = 3.0
 
-        self.element: str = element
-        self.charge: float = 0.0
-        self.alpha: float = 0.0
-        self.epsilon: float = 0.0
-        self.sigma: float = 0.0
-        self.c6: float = 0.0
-        self.c8: float = 0.0
-        self.c10: float = 0.0
-        self.mass: float = element_masses[self.element]
-        self.id: int = 0
+        self.element = element
+        self.charge = 0.0
+        self.alpha = 0.0
+        self.epsilon = 0.0
+        self.sigma = 0.0
+        self.c6 = 0.0
+        self.c8 = 0.0
+        self.c10 = 0.0
+        self.mass = element_masses[self.element]
+        self.atomic_number = atomic_numbers[self.element]
+        self.id = 0
 
-    def __str__(self):
-        return "Atom instance {} {}".format(self.element, self.id)
+    def __str__(self) -> str:
+        return f"Atom instance {self.element} {self.id}"
 
 
 class PBC:
-    def __init__(self, a, b, c, alpha, beta, gamma):
+    a: float
+    b: float
+    c: float
+    alpha: float
+    beta: float
+    gamma: float
+    inverse_volume: float
+    basis_matrix: np.ndarray
+    reciprocal_basis_matrix: np.ndarray
+
+    def __init__(
+        self, a: float, b: float, c: float, alpha: float, beta: float, gamma: float
+    ) -> None:
         self.a = a
         self.b = b
         self.c = c
@@ -362,7 +513,9 @@ class PBC:
             ]
         )
 
-    def update(self, a, b, c, alpha, beta, gamma):
+    def update(
+        self, a: float, b: float, c: float, alpha: float, beta: float, gamma: float
+    ) -> None:
         self.a = a
         self.b = b
         self.c = c
@@ -430,7 +583,7 @@ class PBC:
             ]
         )
 
-    def min_image(self, dx):
+    def min_image(self, dx: np.ndarray) -> np.ndarray:
         img = np.matmul(dx, self.reciprocal_basis_matrix)
         img = np.round(img)
         di = np.matmul(img, self.basis_matrix)
@@ -438,14 +591,14 @@ class PBC:
         r = np.sqrt(np.dot(dx_return, dx_return))
         return r
 
-    def wrap(self, dx):
+    def wrap(self, dx: np.ndarray) -> np.ndarray:
         img = np.matmul(dx, self.reciprocal_basis_matrix)
         img = np.round(img)
         di = np.matmul(img, self.basis_matrix)
         dx_return = dx - di
         return dx_return
 
-    def wrap_forward(self, dx):
+    def wrap_forward(self, dx: np.ndarray) -> np.ndarray:
         img = np.matmul(dx, self.reciprocal_basis_matrix)
         img = np.floor(img)
         di = np.matmul(img, self.basis_matrix)
@@ -453,13 +606,13 @@ class PBC:
         return dx_return
 
 
-def progressbar(it, prefix="", size=60, out=sys.stdout):
+def progressbar(it: Iterable, prefix: str = "", size: int = 60, out: TextIO = sys.stdout) -> Iterator:
     count = len(it)
 
     def show(j):
         x = int(size * j / count)
         print(
-            "{}[{}{}] {}/{}".format(prefix, "█" * x, "." * (size - x), j, count),
+            f"{prefix}[{'█' * x}{'.' * (size - x)}] {j}/{count}",
             end="\r",
             file=out,
             flush=True,
@@ -478,7 +631,6 @@ def get_forcefield(name):
     ffs = []
     opls_aa_uff = {
         "H": {
-            "mass": 1.0079,
             "alpha": 0.41380,
             "sigma": 2.42,
             "epsilon": 15.11,
@@ -487,7 +639,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "C": {
-            "mass": 12.011,
             "alpha": 1.2866,
             "sigma": 3.55,
             "epsilon": 35.25,
@@ -496,7 +647,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "N": {
-            "mass": 14.0067,
             "alpha": 0.97157,
             "sigma": 3.25000,
             "epsilon": 85.60000,
@@ -505,7 +655,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "O": {
-            "mass": 15.999,
             "alpha": 0.852,
             "sigma": 3.118,
             "epsilon": 30.19,
@@ -514,7 +663,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "P": {
-            "mass": 30.974,
             "alpha": 3.35,
             "sigma": 3.69456,
             "epsilon": 153.48197,
@@ -523,7 +671,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Cl": {
-            "mass": 35.4527,
             "alpha": 2.40028,
             "sigma": 3.516377,
             "epsilon": 114.23084,
@@ -532,7 +679,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Zn": {
-            "mass": 65.38,
             "alpha": 1.98870,
             "sigma": 2.46155,
             "epsilon": 62.39923,
@@ -541,7 +687,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Pt": {
-            "mass": 195.084,
             "alpha": 8.56281,
             "sigma": 2.45353,
             "epsilon": 40.25756,
@@ -550,7 +695,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Pd": {
-            "mass": 106.42,
             "alpha": 5.25926,
             "sigma": 2.5827,
             "epsilon": 24.1545,
@@ -559,7 +703,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "B": {
-            "mass": 10.811,
             "alpha": 0.6634,
             "sigma": 3.63754,
             "epsilon": 90.57952,
@@ -568,7 +711,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Ni": {
-            "mass": 58.69340,
             "alpha": 0.38980,
             "sigma": 2.52480,
             "epsilon": 7.55330,
@@ -577,7 +719,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Cr": {
-            "mass": 51.99610,
             "alpha": 3.50740,
             "sigma": 2.69320,
             "epsilon": 7.55330,
@@ -586,7 +727,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Cu": {
-            "mass": 63.54630,
             "alpha": 2.19630,
             "sigma": 3.11400,
             "epsilon": 2.51600,
@@ -595,7 +735,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Co": {
-            "mass": 58.93320,
             "alpha": 3.26440,
             "sigma": 2.55870,
             "epsilon": 7.04980,
@@ -604,7 +743,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "F": {
-            "mass": 18.99800,
             "alpha": 0.444747,
             "sigma": 2.996983,
             "epsilon": 25.160979,
@@ -613,7 +751,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Si": {
-            "mass": 28.08500,
             "alpha": 2.133000,
             "sigma": 3.826410,
             "epsilon": 202.294269,
@@ -622,7 +759,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Br": {
-            "mass": 79.90400,
             "alpha": 3.493000,
             "sigma": 3.732000,
             "epsilon": 126.392600,
@@ -631,7 +767,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "Ti": {
-            "mass": 47.86710,
             "alpha": 3.24280,
             "sigma": 2.82860,
             "epsilon": 8.56050,
@@ -640,7 +775,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "In": {
-            "mass": 114.8180,
             "alpha": 2.00000,
             "sigma": 3.97600,
             "epsilon": 301.40000,
@@ -649,7 +783,6 @@ def get_forcefield(name):
             "c10": 0.0,
         },
         "W": {
-            "mass": 183.84000,
             "alpha": 3.65453,
             "sigma": 2.73420,
             "epsilon": 33.73830,
@@ -662,7 +795,6 @@ def get_forcefield(name):
 
     phahst = {
         "Cu": {
-            "mass": 63.54630,
             "alpha": 0.29252,
             "sigma": 2.73851,
             "epsilon": 8.82345,
@@ -671,7 +803,6 @@ def get_forcefield(name):
             "c10": 13951.49740,
         },
         "C": {
-            "mass": 12.01100,
             "alpha": 0.71317,
             "sigma": 3.35929,
             "epsilon": 4.00147,
@@ -680,7 +811,6 @@ def get_forcefield(name):
             "c10": 27317.97855,
         },
         "O": {
-            "mass": 15.99900,
             "alpha": 1.68064,
             "sigma": 3.23867,
             "epsilon": 3.89544,
@@ -689,7 +819,6 @@ def get_forcefield(name):
             "c10": 19820.89339,
         },
         "H": {
-            "mass": 1.00790,
             "alpha": 0.02117,
             "sigma": 1.87446,
             "epsilon": 3.63874,
@@ -721,12 +850,12 @@ def gcd_list(my_list):
     return result
 
 
-def read_pdb(system, filename):
-    file = open(filename, "r")
+def read_pdb(file):
     line = file.readline()
     pbc = None
+    system = []
     try:
-        for line in progressbar(file.readlines(), "Reading file {} ".format(filename)):
+        for line in progressbar(file.readlines(), f"Reading file {sys.argv[1]} "):
             tokens = line.split()
 
             # ignore these lines
@@ -766,19 +895,19 @@ def read_pdb(system, filename):
                 pbc = PBC(a, b, c, alpha, beta, gamma)
 
     except ValueError:
-        sys.exit("Error reading line:\n{}".format(line))
+        sys.exit(f"Error reading line:\n{line}\n")
 
     print("")
     set_atom_ids(system)
     file.close()
-    return pbc
+    return system, pbc
 
 
-def read_xyz(system, filename):
-    file = open(filename, "r")
+def read_xyz(file):
     file.readline()
     line = file.readline()
     pbc = None
+    system = []
 
     try:
         tokens = line.split()
@@ -795,7 +924,7 @@ def read_xyz(system, filename):
         print("Couldn't locate a b c alpha beta gamma on second line of .xyz file")
 
     try:
-        for line in progressbar(file.readlines(), "Reading file {} ".format(filename)):
+        for line in progressbar(file.readlines(), f"Reading file {sys.argv[1]} "):
             # ignore blank lines
             if line == "" or line == "\n":
                 continue
@@ -813,11 +942,11 @@ def read_xyz(system, filename):
             system.append(atom)
 
     except ValueError:
-        sys.exit("Error reading line:\n{}".format(line))
+        sys.exit(f"Error reading line:\n{line}")
 
     set_atom_ids(system)
     file.close()
-    return pbc
+    return system, pbc
 
 
 def overlap_detector(system, pbc):
@@ -833,14 +962,9 @@ def overlap_detector(system, pbc):
                     if r < 0.05:
                         overlapping_atoms = True
                         messages.append(
-                            "Deleting overlapping atoms\n{:>3} {:>5} --- {:>3} {:>5}\n {}\n {}".format(
-                                atom.element,
-                                atom.id,
-                                atom2.element,
-                                atom2.id,
-                                atom.x,
-                                atom2.x,
-                            )
+                            f"Deleting overlapping atoms\n"
+                            f"{atom.element:>3} {atom.id:>5} --- {atom2.element:>3} {atom2.id:>5}\n"
+                            f"{atom.x}\n {atom2.x}"
                         )
                         system.remove(atom2)
     set_atom_ids(system)
@@ -858,11 +982,9 @@ def list_close_contacts(system, pbc):
                 vdw = 0.5 * (atom.vdw + atom2.vdw)
                 bond_r = 0.5 * (atom.bond_r + atom2.bond_r)
                 if vdw > r > bond_r:
-                    element_string = "{}-{}".format(atom.element, atom2.element)
+                    element_string = f"{atom.element}-{atom2.element}"
                     messages.append(
-                        "{:<5} {:>5} {:>5}   r = {}".format(
-                            element_string, atom.id, atom2.id, round(r, 6)
-                        )
+                        f"{element_string:<5} {atom.id:>5} {atom2.id:>5}   r = {round(r, 6)}"
                     )
     print("\nClose contacts:\n")
     for message in messages:
@@ -878,11 +1000,9 @@ def list_bonds(system, pbc):
                 r = pbc.min_image(dx)
                 bond_r = 0.5 * (atom.bond_r + atom2.bond_r)
                 if r < bond_r:
-                    element_string = "{}-{}".format(atom.element, atom2.element)
+                    element_string = f"{atom.element}-{atom2.element}"
                     messages.append(
-                        "{:<5} {:>5} {:>5}   r = {}".format(
-                            element_string, atom.id, atom2.id, round(r, 6)
-                        )
+                        f"{element_string:<5} {atom.id:>5} {atom2.id:>5}   r = {round(r, 6)}"
                     )
     print("\nBonded atoms:\n")
     for message in messages:
@@ -916,19 +1036,12 @@ def list_angles(system, pbc):
                         bond_angle = np.degrees(
                             np.arccos(np.clip(np.dot(u_dx1, u_dx2), -1.0, 1.0))
                         )
-                        element_string = "{}-{}-{}".format(
-                            atom.element, atom2.element, atom3.element
+                        element_string = (
+                            f"{atom.element}-{atom2.element}-{atom3.element}"
                         )
                         messages.append(
-                            "{:<7} {:>5} {:>5} {:>5}   angle = {:>6} r1, r2 = {:>6}, {:>6}".format(
-                                element_string,
-                                atom.id,
-                                atom2.id,
-                                atom3.id,
-                                np.round(bond_angle, 2),
-                                np.round(r1, 3),
-                                np.round(r2, 3),
-                            )
+                            f"{element_string:<7} {atom.id:>5} {atom2.id:>5} {atom3.id:>5}   "
+                            f"angle = {np.round(bond_angle, 2):>6} r1, r2 = {np.round(r1, 3):>6}, {np.round(r2, 3):>6}"
                         )
     print("\nAngles:\n")
     for message in messages:
@@ -953,7 +1066,7 @@ def list_lone_atoms(system, pbc):
     else:
         print("\nLone atoms:\n")
         for atom in lone_atoms:
-            print("{:>3} {:>5} {}".format(atom.element, atom.id, atom.x))
+            print(f"{atom.element:>3} {atom.id:>5} {atom.x}")
 
 
 def delete_lone_atoms(system, pbc):
@@ -974,22 +1087,19 @@ def delete_lone_atoms(system, pbc):
     else:
         print("\nDeleting lone atoms:\n")
         for atom in lone_atoms:
-            print("{:>3} {:>5} {}".format(atom.element, atom.id, atom.x))
+            print("{atom.element:>3} {atom.id:>5} {atom.x}")
             system.remove(atom)
+    return system
 
 
 def write_xyz(system, pbc, filename):
     out = open(filename, "w")
     out.write(str(len(system)))
-    out.write(
-        "\n{} {} {} {} {} {}\n".format(
-            pbc.a, pbc.b, pbc.c, pbc.alpha, pbc.beta, pbc.gamma
-        )
-    )
+    out.write(f"\n{pbc.a} {pbc.b} {pbc.c} {pbc.alpha} {pbc.beta} {pbc.gamma}\n")
     for atom in system:
-        out.write("{} {} {} {}\n".format(atom.element, atom.x[0], atom.x[1], atom.x[2]))
+        out.write(f"{atom.element} {atom.x[0]} {atom.x[1]} {atom.x[2]}\n")
     out.close()
-    print("Wrote {}".format(filename))
+    print(f"Wrote {filename}")
 
 
 def write_standard_pdb(system, pbc, filename):
@@ -997,17 +1107,11 @@ def write_standard_pdb(system, pbc, filename):
 
     out = open(filename, "w")
     out.write("MODEL        1\n")
-    out.write("COMPND    {:<69}\n".format(filename))
+    out.write(f"COMPND    {filename:<69}\n")
     out.write("AUTHOR    GENERATED BY PDB WIZARD\n")
     out.write(
-        "CRYST1  {:>7}  {:7}  {:7} {:>6} {:>6} {:>6} P 1           1\n".format(
-            round(pbc.a, 3),
-            round(pbc.b, 3),
-            round(pbc.c, 3),
-            round(pbc.alpha, 2),
-            round(pbc.beta, 2),
-            round(pbc.gamma, 2),
-        )
+        f"CRYST1  {round(pbc.a, 3):>7}  {round(pbc.b, 3):7}  {round(pbc.c, 3):7} "
+        f"{round(pbc.alpha, 2):>6} {round(pbc.beta, 2):>6} {round(pbc.gamma, 2):>6} P 1           1\n"
     )
 
     atom_id = 1
@@ -1065,16 +1169,9 @@ def write_standard_pdb(system, pbc, filename):
             atom.x = base_atom.x + dx
 
             out.write(
-                "HETATM {:>4}  {:<3} {:>3} A {:>4}    {:>7} {:>7} {:>7}  1.00  0.00          {:>2}\n".format(
-                    atom.id,
-                    atom.name,
-                    mol_name,
-                    idx + 1,
-                    round(atom.x[0], 3),
-                    round(atom.x[1], 3),
-                    round(atom.x[2], 3),
-                    atom.element,
-                )
+                f"HETATM {atom.id:>4}  {atom.name:<3} {mol_name:>3} A {idx + 1:>4}    "
+                f"{round(atom.x[0], 3):>7} {round(atom.x[1], 3):>7} {round(atom.x[2], 3):>7}  1.00  0.00          "
+                f"{atom.element:>2}\n"
             )
 
             atom_id += 1
@@ -1086,15 +1183,15 @@ def write_standard_pdb(system, pbc, filename):
         mol_elements = [atom.element for atom in mol]
 
         if mol_elements == ["Cl", "Cl", "Cl", "Cl", "Zn"]:
-            out.write("CONECT {:>4} {:>4}\n".format(mol[0].id, mol[4].id))
-            out.write("CONECT {:>4} {:>4}\n".format(mol[1].id, mol[4].id))
-            out.write("CONECT {:>4} {:>4}\n".format(mol[2].id, mol[4].id))
-            out.write("CONECT {:>4} {:>4}\n".format(mol[3].id, mol[4].id))
+            out.write(f"CONECT {mol[0].id:>4} {mol[4].id:>4}\n")
+            out.write(f"CONECT {mol[1].id:>4} {mol[4].id:>4}\n")
+            out.write(f"CONECT {mol[2].id:>4} {mol[4].id:>4}\n")
+            out.write(f"CONECT {mol[3].id:>4} {mol[4].id:>4}\n")
 
     out.write("END\n")
     out.close()
     set_atom_ids(system)
-    print("Wrote {}".format(filename))
+    print(f"Wrote {filename}")
 
 
 def find_molecules(system, pbc):
@@ -1128,8 +1225,45 @@ def find_molecules(system, pbc):
         if lone:
             merge_lists.append([atom.id])
 
+    merge_mol_lists = []
+
+    for idx1, merge_list1 in enumerate(merge_lists):
+
+        mol_already_in_merge = False
+        for mol_list in merge_mol_lists:
+
+            if idx1 in mol_list:
+                mol_already_in_merge = True
+
+        if mol_already_in_merge:
+            continue
+
+        other_mols = [idx1]
+
+        for idx2, merge_list2 in enumerate(merge_lists):
+            if idx1 == idx2:
+                continue
+            for atom_id1 in merge_list1:
+                for atom_id2 in merge_list2:
+                    if atom_id1 == atom_id2:
+                        if idx2 not in other_mols:
+                            other_mols.append(idx2)
+                            continue
+
+        merge_mol_lists.append(other_mols)
+
+    final_merge_list = []
+
+    for mol_ids in merge_mol_lists:
+        atom_ids = []
+        for mol_id in mol_ids:
+            for atom_id in merge_lists[mol_id]:
+                atom_ids.append(atom_id)
+        atom_ids = list(set(atom_ids))
+        final_merge_list.append(atom_ids)
+
     mols = [
-        [system[atom_id - 1] for atom_id in merge_list] for merge_list in merge_lists
+        [system[atom_id - 1] for atom_id in merge_list] for merge_list in final_merge_list
     ]
 
     return mols
@@ -1146,9 +1280,7 @@ def apply_ff_to_system(system, ff):
             atom.c10 = ff[atom.element]["c10"]
         except KeyError:
             print(
-                "!!! atom {} not found in forcefield, parameters set to all zeros !!!".format(
-                    atom.element
-                )
+                f"!!! atom {atom.element} not found in forcefield, parameters set to all zeros !!!"
             )
             atom.alpha = 0.0
             atom.epsilon = 0.0
@@ -1161,38 +1293,25 @@ def apply_ff_to_system(system, ff):
 def write_mpmc_pdb(system, pbc, filename, write_charges=False, write_params=False):
     out = open(filename, "w")
     out.write(
-        "CRYST1  {:>7}  {:7}  {:7} {:>6} {:>6} {:>6} P 1           1\n".format(
-            round(pbc.a, 3),
-            round(pbc.b, 3),
-            round(pbc.c, 3),
-            round(pbc.alpha, 2),
-            round(pbc.beta, 2),
-            round(pbc.gamma, 2),
-        )
+        f"CRYST1  {round(pbc.a, 3):>7}  {round(pbc.b, 3):7}  {round(pbc.c, 3):7} "
+        f"{round(pbc.alpha, 2):>6} {round(pbc.beta, 2):>6} {round(pbc.gamma, 2):>6} P 1           1\n"
     )
     for atom in progressbar(system):
         out.write(
-            "ATOM {:>6} {:<4} MOF F    1    {:>7} {:>7} {:>7}".format(
-                atom.id,
-                atom.element,
-                round(atom.x[0], 3),
-                round(atom.x[1], 3),
-                round(atom.x[2], 3),
-                atom.element,
-            )
+            f"ATOM {atom.id:>6} {atom.element:<4} MOF F    1    "
+            f"{round(atom.x[0], 3):>7} {round(atom.x[1], 3):>7} {round(atom.x[2], 3):>7}"
         )
         if write_params is True:
-            out.write(" {:>9.6}".format(atom.mass))
+            out.write(f" {atom.mass:>9.6}")
         if write_charges is True or write_params is True:
-            out.write(" {:>8.4}".format(atom.charge))
+            out.write(f" {atom.charge:>8.4}")
         if write_params is True:
             out.write(
-                " {:>8.4} {:>8.4} {:>8.4} 0.0 0.0 {:>8.4} {:>10.4} {:>10.2}\n".format(
-                    atom.alpha, atom.epsilon, atom.sigma, atom.c6, atom.c8, atom.c10
-                )
+                f" {atom.alpha:>8.4} {atom.epsilon:>8.4} {atom.sigma:>8.4} "
+                f"0.0 0.0 {atom.c6:>8.4} {atom.c8:>10.4} {atom.c10:>10.2}\n"
             )
         else:
-            out.write(" xxx{}xxx\n".format(atom.name.strip()))
+            out.write(f" xxx{atom.name.strip()}xxx\n")
     borders = [
         array([0, 0, 0]),
         array([1, 0, 0]),
@@ -1206,14 +1325,8 @@ def write_mpmc_pdb(system, pbc, filename, write_charges=False, write_params=Fals
     for ind, pos in enumerate(borders):
         border_pos = np.matmul(pos, pbc.basis_matrix)
         out.write(
-            "ATOM {:>6} {:<4} BOX F    2    {:>7} {:>7} {:>7} 0.0 0.0 0.0 0.0 0.0"
-            "\n".format(
-                len(system) + ind,
-                "X",
-                round(border_pos[0], 3),
-                round(border_pos[1], 3),
-                round(border_pos[2], 3),
-            )
+            f"ATOM {len(system) + ind:>6} {'X':<4} BOX F    2    {round(border_pos[0], 3):>7} "
+            f"{round(border_pos[1], 3):>7} {round(border_pos[2], 3):>7} 0.0 0.0 0.0 0.0 0.0\n"
         )
     connections = [
         [0, 1],
@@ -1231,71 +1344,62 @@ def write_mpmc_pdb(system, pbc, filename, write_charges=False, write_params=Fals
     ]
     for connection in connections:
         out.write(
-            "CONECT {:>4} {:>4}\n".format(
-                len(system) + connection[0], len(system) + connection[1]
-            )
+            f"CONECT {len(system) + connection[0]:>4} {len(system) + connection[1]:>4}\n"
         )
     out.write(
-        "REMARK BOX BASIS[0] = {:20.14f} {:20.14f} {:20.14f}\n".format(
-            pbc.basis_matrix[0][0], pbc.basis_matrix[0][1], pbc.basis_matrix[0][2]
-        )
+        f"REMARK BOX BASIS[0] = {pbc.basis_matrix[0][0]:20.14f} {pbc.basis_matrix[0][1]:20.14f} "
+        f"{pbc.basis_matrix[0][2]:20.14f}\n"
     )
     out.write(
-        "REMARK BOX BASIS[1] = {:20.14f} {:20.14f} {:20.14f}\n".format(
-            pbc.basis_matrix[1][0], pbc.basis_matrix[1][1], pbc.basis_matrix[1][2]
-        )
+        f"REMARK BOX BASIS[1] = {pbc.basis_matrix[1][0]:20.14f} {pbc.basis_matrix[1][1]:20.14f} "
+        f"{pbc.basis_matrix[1][2]:20.14f}\n"
     )
     out.write(
-        "REMARK BOX BASIS[2] = {:20.14f} {:20.14f} {:20.14f}\n".format(
-            pbc.basis_matrix[2][0], pbc.basis_matrix[2][1], pbc.basis_matrix[2][2]
-        )
+        f"REMARK BOX BASIS[2] = {pbc.basis_matrix[2][0]:20.14f} {pbc.basis_matrix[2][1]:20.14f} "
+        f"{pbc.basis_matrix[2][2]:20.14f}\n"
     )
     out.write("END\n")
     out.close()
-    print("Wrote {}".format(filename))
+    print(f"Wrote {filename}")
 
 
 def print_info(system, pbc, filename):
     print("")
+    print(r"   ___  ___  ___   __    __ _                  _ ")
+    print(r"  / _ \/   \/ __\ / / /\ \ (_)______ _ _ __ __| |")
+    print(r" / /_)/ /\ /__\// \ \/  \/ / |_  / _` | '__/ _` |")
+    print(r"/ ___/ /_// \/  \  \  /\  /| |/ / (_| | | | (_| |")
+    print(r"\/  /___,'\_____/   \/  \/ |_/___\__,_|_|  \__,_|")
+    print(f"\nfilename: {filename}")
     print(
-        r"   ___  ___  ___   __    __ _                  _ " + "\n"
-        r"  / _ \/   \/ __\ / / /\ \ (_)______ _ _ __ __| |" + "\n"
-        r" / /_)/ /\ /__\// \ \/  \/ / |_  / _` | '__/ _` |" + "\n"
-        r"/ ___/ /_// \/  \  \  /\  /| |/ / (_| | | | (_| |" + "\n"
-        r"\/  /___,'\_____/   \/  \/ |_/___\__,_|_|  \__,_|"
-    )
-    print("\nfilename: {}".format(filename))
-    print(
-        "\nCell:\n{:>7}  {:7}  {:7} {:>6} {:>6} {:>6}\n".format(
-            round(pbc.a, 3),
-            round(pbc.b, 3),
-            round(pbc.c, 3),
-            round(pbc.alpha, 2),
-            round(pbc.beta, 2),
-            round(pbc.gamma, 2),
-        )
+        f"\nCell:\n{round(pbc.a, 3):>7}  {round(pbc.b, 3):7}  {round(pbc.c, 3):7} "
+        f"{round(pbc.alpha, 2):>6} {round(pbc.beta, 2):>6} {round(pbc.gamma, 2):>6}\n"
     )
     print(
-        "{:20.14f} {:20.14f} {:20.14f}".format(
-            pbc.basis_matrix[0][0], pbc.basis_matrix[0][1], pbc.basis_matrix[0][2]
-        )
+        f"{pbc.basis_matrix[0][0]:20.14f} {pbc.basis_matrix[0][1]:20.14f} {pbc.basis_matrix[0][2]:20.14f}"
     )
     print(
-        "{:20.14f} {:20.14f} {:20.14f}".format(
-            pbc.basis_matrix[1][0], pbc.basis_matrix[1][1], pbc.basis_matrix[1][2]
-        )
+        f"{pbc.basis_matrix[1][0]:20.14f} {pbc.basis_matrix[1][1]:20.14f} {pbc.basis_matrix[1][2]:20.14f}"
     )
     print(
-        "{:20.14f} {:20.14f} {:20.14f}".format(
-            pbc.basis_matrix[2][0], pbc.basis_matrix[2][1], pbc.basis_matrix[2][2]
-        )
+        f"{pbc.basis_matrix[2][0]:20.14f} {pbc.basis_matrix[2][1]:20.14f} {pbc.basis_matrix[2][2]:20.14f}"
     )
     print(
-        "Volume: {:10.2f} A^3 Density: {:10.4} g/cm^3".format(
-            pbc.volume, sum([atom.mass for atom in system]) * 1.66054 / pbc.volume
-        )
+        f"Volume: {pbc.volume:10.2f} A^3 Density: "
+        f"{sum([atom.mass for atom in system]) * 1.66054 / pbc.volume:10.4} g/cm^3"
     )
     print_formula_unit(system)
+
+
+def print_info_movie(systems, pbcs, filename):
+    print("")
+    print(r"   ___  ___  ___   __    __ _                  _ ")
+    print(r"  / _ \/   \/ __\ / / /\ \ (_)______ _ _ __ __| |")
+    print(r" / /_)/ /\ /__\// \ \/  \/ / |_  / _` | '__/ _` |")
+    print(r"/ ___/ /_// \/  \  \  /\  /| |/ / (_| | | | (_| |")
+    print(r"\/  /___,'\_____/   \/  \/ |_/___\__,_|_|  \__,_|")
+    print("")
+    print(f"Movie detected\n{len(systems)} frames")
 
 
 def print_formula_unit(system):
@@ -1307,25 +1411,61 @@ def print_formula_unit(system):
             atom_dict[atom.element] += 1
     print("\nTotal number of atoms:\n")
     for ele in atom_dict:
-        print("{} {}".format(ele, atom_dict[ele]))
+        print(f"{ele} {atom_dict[ele]}")
     atom_n = [atom_dict[i] for i in atom_dict]
     atoms_gcd = gcd_list(atom_n)
     print("\nFormula unit\n")
     for ele in atom_dict:
-        print("{} {}".format(ele, int(atom_dict[ele] / atoms_gcd)))
+        print(f"{ele} {int(atom_dict[ele] / atoms_gcd)}")
 
 
 def sort(system, pbc):
+    atom_sorts = [
+        {"name": "element", "key": lambda atom: atom.element, "reverse": False}
+    ]
+
+    mol_sorts = [
+        {
+            "name": "first atom's element",
+            "key": lambda mol: mol[0].element,
+            "reverse": False,
+        },
+        {"name": "length of molecule", "key": lambda mol: len(mol), "reverse": True},
+        {
+            "name": "if molecule contains heavy atoms",
+            "key": lambda mol: 0 if np.max([atom.mass for atom in mol]) > 16 else 1,
+            "reverse": False,
+        },
+    ]
+
+    print("sorting inside molecules:")
+
+    for sorting_options in reversed(atom_sorts):
+        print(
+            f"    by {sorting_options['name']} - reverse: {sorting_options['reverse']}"
+        )
+
+    print("sorting molecules:")
+
+    for sorting_options in reversed(mol_sorts):
+        print(
+            f"    by {sorting_options['name']} - reverse: {sorting_options['reverse']}"
+        )
+
     mols = find_molecules(system, pbc)
-    for idx, mol in enumerate(mols):
-        mol.sort(key=lambda atom: atom.element)
-    mols.sort(key=lambda mol: mol[0].element)
-    mols.sort(key=lambda mol: len(mol), reverse=True)
-    mols.sort(key=lambda mol: 0 if np.max([atom.mass for atom in mol]) > 16 else 1)
+
+    for mol in mols:
+        for sorting_options in atom_sorts:
+            mol.sort(key=sorting_options["key"], reverse=sorting_options["reverse"])
+
+    for sorting_options in mol_sorts:
+        mols.sort(key=sorting_options["key"], reverse=sorting_options["reverse"])
+
     system = []
     for mol in mols:
         for atom in mol:
             system.append(atom)
+
     return system
 
 
@@ -1343,48 +1483,30 @@ def wrapall(system, pbc):
 
 def extend_axis(system, pbc):
     print(
-        "\nCurrent cell:\n{:>7}  {:7}  {:7} {:>6} {:>6} {:>6}\n".format(
-            round(pbc.a, 3),
-            round(pbc.b, 3),
-            round(pbc.c, 3),
-            round(pbc.alpha, 2),
-            round(pbc.beta, 2),
-            round(pbc.gamma, 2),
-        )
+        f"\nCurrent cell:\n{round(pbc.a, 3):>7}  {round(pbc.b, 3):7}  {round(pbc.c, 3):7} "
+        f"{round(pbc.alpha, 2):>6} {round(pbc.beta, 2):>6} {round(pbc.gamma, 2):>6}\n"
     )
     print(
-        "{:20.14f} {:20.14f} {:20.14f}".format(
-            pbc.basis_matrix[0][0], pbc.basis_matrix[0][1], pbc.basis_matrix[0][2]
-        )
+        f"{pbc.basis_matrix[0][0]:20.14f} {pbc.basis_matrix[0][1]:20.14f} {pbc.basis_matrix[0][2]:20.14f}"
     )
     print(
-        "{:20.14f} {:20.14f} {:20.14f}".format(
-            pbc.basis_matrix[1][0], pbc.basis_matrix[1][1], pbc.basis_matrix[1][2]
-        )
+        f"{pbc.basis_matrix[1][0]:20.14f} {pbc.basis_matrix[1][1]:20.14f} {pbc.basis_matrix[1][2]:20.14f}"
     )
     print(
-        "{:20.14f} {:20.14f} {:20.14f}".format(
-            pbc.basis_matrix[2][0], pbc.basis_matrix[2][1], pbc.basis_matrix[2][2]
-        )
+        f"{pbc.basis_matrix[2][0]:20.14f} {pbc.basis_matrix[2][1]:20.14f} {pbc.basis_matrix[2][2]:20.14f}"
     )
     while True:
         try:
             axis = input(
                 "\nWhat axis would you like to extend? 0, 1, 2 or x, y, z or q(uit)\n\n> "
             )
-            if (
-                axis == "q"
-                or axis == "quit"
-                or axis == "Q"
-                or axis == "Quit"
-                or axis == "QUIT"
-            ):
+            if axis.lower() == "q" or axis.lower() == "quit":
                 return
-            if axis == "x" or axis == "X":
+            if axis.lower() == "x":
                 axis = 0
-            elif axis == "y" or axis == "Y":
+            elif axis.lower() == "y":
                 axis = 1
-            elif axis == "z" or axis == "Z":
+            elif axis.lower() == "z":
                 axis = 2
             axis = int(axis)
             if axis < 0 or axis > 2:
@@ -1423,7 +1545,7 @@ def extend_axis(system, pbc):
 
 def list_coords(system):
     for atom in system:
-        print("{} {}".format(atom.element, atom.x))
+        print(f"{atom.element} {atom.x}")
 
 
 def vmd_preview(system, pbc):
@@ -1443,9 +1565,7 @@ def edit_h_dist(system, pbc):
             if second_element not in list_of_elements:
                 raise ValueError
             distance = input(
-                "\nWhat distance (in angstroms) shall {}-H bonds be set to?\n\n> ".format(
-                    second_element
-                )
+                f"\nWhat distance (in angstroms) shall {second_element}-H bonds be set to?\n\n> "
             )
             distance = float(distance)
             break
@@ -1468,17 +1588,18 @@ def edit_h_dist(system, pbc):
                     r = pbc.min_image(dx)
                     bond_r = 0.5 * (atom.bond_r + atom2.bond_r)
                     if r < bond_r:
-                        element_string = "{}-{}".format(atom.element, atom2.element)
+                        element_string = f"{atom.element}-{atom2.element}"
                         messages.append(
-                            "{:<5} {:>5} {:>5}".format(
-                                element_string, atom.id, atom2.id
-                            )
+                            f"{element_string:<5} {atom.id:>5} {atom2.id:>5}"
                         )
                         dx = pbc.wrap(dx)
                         dx *= distance / r
                         h_atom.x = other_atom.x + dx
+
     for message in messages:
         print(message)
+
+    return system
 
 
 def write_mpmc_options(system, pbc):
@@ -1587,7 +1708,7 @@ def write_mpmc_options(system, pbc):
     return
 
 
-def geom_analysis(system, pbc):
+def menu_geom_analysis(system, pbc):
     while True:
         option = 0
         try:
@@ -1601,7 +1722,7 @@ def geom_analysis(system, pbc):
                 6 = list coordinates\n\
                 7 = edit hydrogen bond distances\n\
                 8 = preview with VMD\n\
-                9 = back to main menu\n\n> "
+                0 = back to main menu\n\n> "
             )
             option = int(option)
         except ValueError:
@@ -1615,18 +1736,44 @@ def geom_analysis(system, pbc):
         elif option == 4:
             list_lone_atoms(system, pbc)
         elif option == 5:
-            delete_lone_atoms(system, pbc)
+            system = delete_lone_atoms(system, pbc)
         elif option == 6:
             list_coords(system)
         elif option == 7:
-            edit_h_dist(system, pbc)
+            system = edit_h_dist(system, pbc)
         elif option == 8:
             vmd_preview(system, pbc)
-        elif option == 9:
-            return
+        elif option == 0:
+            return system, pbc
 
 
-def update_pbc(pbc):
+def menu_write_files(system, pbc):
+    while True:
+        option = -1
+        try:
+            option = input(
+                "\nWhat would you like to do?\n\n"
+                "1 = write xyz file\n"
+                "2 = write MPMC PDB file\n"
+                "3 = write standard PDB file\n"
+                "0 = back to main menu\n\n> "
+            )
+            option = int(option)
+            if option == 1:
+                filename = input("\noutput filename > ")
+                write_xyz(system, pbc, filename)
+            elif option == 2:
+                write_mpmc_options(system, pbc)
+            elif option == 3:
+                filename = input("\noutput filename > ")
+                write_standard_pdb(system, pbc, filename)
+            elif option == 0:
+                return
+        except ValueError:
+            print("!!! Error converting input to int !!!")
+
+
+def menu_update_pbc(pbc):
     while True:
         try:
             a = input("Enter cell information\na>     ")
@@ -1645,95 +1792,259 @@ def update_pbc(pbc):
         except ValueError:
             print("!!! Error converting input to float !!!\n")
     pbc.update(a, b, c, alpha, beta, gamma)
+    return pbc
 
 
-def main_loop():
-    if len(sys.argv) != 2:
-        sys.exit("Usage: python3 pdb_wizard.py <filename.[xyz|pdb]>")
+def menu_extend_wrap(system, pbc):
+    while True:
+        option = -1
+        try:
+            option = input(
+                "\nWhat would you like to do?\n\n"
+                "1 = extend along axis\n"
+                "2 = wrap atoms from (0, 0, 0) to (1, 1, 1)\n"
+                "3 = wrap atoms from (-1/2, -1/2, -1/2) to (1/2, 1/2, 1/2)\n"
+                "4 = sort atoms\n"
+                "0 = back to main menu\n\n> "
+            )
+            option = int(option)
+            if option == 1:
+                extend_axis(system, pbc)
+            elif option == 2:
+                wrapall_forward(system, pbc)
+            elif option == 3:
+                wrapall(system, pbc)
+            elif option == 4:
+                system = sort(system, pbc)
+            elif option == 0:
+                return system, pbc
+        except ValueError:
+            print("!!! Error converting input to int !!!")
 
-    system = []
 
-    input_filename = sys.argv[1]
+def menu_movie_extend_wrap(systems, pbcs):
+    return systems, pbcs
 
-    if input_filename.split(".")[-1] == "xyz":
-        pbc = read_xyz(system, input_filename)
-    elif (
-        input_filename.split(".")[-1] == "pdb" or input_filename.split(".")[-1] == "ent"
-    ):
-        pbc = read_pdb(system, input_filename)
-    elif input_filename.split(".")[-1] == "cif":
-        sys.exit("Use Mercury to save a .cif as a .xyz or .pdb first")
-    else:
-        sys.exit("Unable to determine if input file is xyz or pdb (please rename)")
 
-    if pbc is None:
-        while True:
-            try:
-                a = input("Enter cell information\na>     ")
-                a = float(a)
-                b = input("b>     ")
-                b = float(b)
-                c = input("c>     ")
-                c = float(c)
-                alpha = input("alpha> ")
-                alpha = float(alpha)
-                beta = input("beta>  ")
-                beta = float(beta)
-                gamma = input("gamma> ")
-                gamma = float(gamma)
-                break
-            except ValueError:
-                print("!!! Error converting input to float !!!\n")
-        pbc = PBC(a, b, c, alpha, beta, gamma)
+def menu_movie_write_files(systems, pbcs):
+    pass
 
+
+def menu_movie_create_movie(systems, pbcs):
+    pass
+
+
+def main_loop_movie(systems, pbcs):
+    print_info_movie(systems, pbcs, sys.argv[1])
+
+    while True:
+        option = -1
+        try:
+            option = input(
+                "\nWhat would you like to do?\n\n"
+                "1 = extend, wrap, sort\n"
+                "2 = write files\n"
+                "3 = create movie\n"
+                "0 = quit\n\n> "
+            )
+            option = int(option)
+            if option == 1:
+                systems, pbcs = menu_movie_extend_wrap(systems, pbcs)
+            elif option == 2:
+                menu_movie_write_files(systems, pbcs)
+            elif option == 3:
+                menu_movie_create_movie(systems, pbcs)
+            elif option == 0:
+                return
+        except ValueError:
+            print("!!! Error converting input to int !!!")
+
+
+def main_loop_single(system, pbc):
     overlap_detector(system, pbc)
 
     while True:
-        print_info(system, pbc, input_filename)
-        option = 0
+        print_info(system, pbc, sys.argv[1])
+        option = -1
         try:
             option = input(
-                "\nWhat would you like to do?\n\n\
-                1 = geometry analysis\n\
-                2 = extend along axis\n\
-                3 = wrap atoms from (0, 0, 0) to (1, 1, 1)\n\
-                4 = wrap atoms from (-1/2, -1/2, -1/2) to (1/2, 1/2, 1/2)\n\
-                5 = sort atoms\n\
-                6 = update cell dimensions\n\
-                7 = write .xyz\n\
-                8 = write MPMC .pdb\n\
-                9 = write standardized .pdb\n\
-                0 = quit\n\n> "
+                "\nWhat would you like to do?\n\n"
+                "1 = geometry analysis\n"
+                "2 = extend axis, wrap, or sort\n"
+                "3 = write files\n"
+                "4 = update unit cell\n"
+                "0 = quit\n\n> "
             )
             option = int(option)
         except ValueError:
             print("!!! Error converting input to int !!!")
         if option == 1:
-            geom_analysis(system, pbc)
+            system, pbc = menu_geom_analysis(system, pbc)
         elif option == 2:
-            extend_axis(system, pbc)
+            system, pbc = menu_extend_wrap(system, pbc)
         elif option == 3:
-            wrapall_forward(system, pbc)
+            menu_write_files(system, pbc)
         elif option == 4:
-            wrapall(system, pbc)
-        elif option == 5:
-            system = sort(system, pbc)
-        elif option == 6:
-            update_pbc(pbc)
-        elif option == 7:
-            filename = input("\noutput filename > ")
-            write_xyz(system, pbc, filename)
-        elif option == 8:
-            write_mpmc_options(system, pbc)
-        elif option == 9:
-            filename = input("\noutput filename > ")
-            write_standard_pdb(system, pbc, filename)
+            pbc = menu_update_pbc(pbc)
         elif option == 0:
             break
         else:
             print("\nInvalid option!")
 
 
+def check_xyz_trajectory(filename):
+    f = open(filename, "r")
+    try:
+        n_atoms = int(f.readline())
+        f.readline()
+        for i in range(n_atoms):
+            if f.readline() == "":
+                return False
+        line = f.readline()
+        if line == "":
+            return False
+        n_atoms = int(line)
+        f.readline()
+        for i in range(n_atoms):
+            if f.readline() == "":
+                return False
+    except:
+        return False
+
+    return True
+
+
+def check_pdb_trajectory(filename):
+    f = open(filename, "r")
+    try:
+        line = f.readline()
+        n_frames = 0
+        while line != "":
+            if line[:6] == "MODEL ":
+                n_frames += 1
+            line = f.readline()
+    except:
+        return False
+
+    if n_frames > 1:
+        return True
+    else:
+        return False
+
+
+def read_xyz_trajectory(file):
+    systems = []
+    pbcs = []
+
+    return systems, pbcs
+
+
+def read_pdb_trajectory(file):
+    systems = []
+    pbcs = []
+
+    one_frame = io.StringIO()
+    line = file.readline()
+    one_frame.write(line)
+    while line != "":
+        line = file.readline()
+        one_frame.seek(0)
+        if line[:6] == "MODEL " and len(one_frame.readlines()) > 1:
+            one_frame.seek(0)
+            system, pbc = read_pdb(one_frame)
+            systems.append(system)
+            pbcs.append(pbc)
+            one_frame.close()
+            one_frame = io.StringIO()
+        one_frame.seek(0, 2)
+        one_frame.write(line)
+    one_frame.seek(0)
+    system, pbc = read_pdb(one_frame)
+    systems.append(system)
+    pbcs.append(pbc)
+    one_frame.close()
+
+    return systems, pbcs
+
+
+def load_file_and_run_menu():
+    if len(sys.argv) != 2:
+        sys.exit("Usage: python3 pdb_wizard.py <filename.[xyz|pdb]>")
+
+    input_filename = sys.argv[1]
+
+    is_trajectory = False
+
+    if input_filename.split(".")[-1] == "xyz":
+        is_trajectory = check_xyz_trajectory(input_filename)
+    elif (
+        input_filename.split(".")[-1] == "pdb" or input_filename.split(".")[-1] == "ent"
+    ):
+        is_trajectory = check_pdb_trajectory(input_filename)
+    elif input_filename.split(".")[-1] == "cif":
+        sys.exit("Use Mercury to save a .cif as a .xyz or .pdb first")
+    else:
+        sys.exit("Unable to determine if input file is xyz or pdb (please rename)")
+
+    if is_trajectory:
+        if input_filename.split(".")[-1] == "xyz":
+            file = open(input_filename, "r")
+            systems, pbcs = read_xyz_trajectory(file)
+            file.close()
+        elif (
+            input_filename.split(".")[-1] == "pdb"
+            or input_filename.split(".")[-1] == "ent"
+        ):
+            file = open(input_filename, "r")
+            systems, pbcs = read_pdb_trajectory(file)
+            file.close()
+        else:
+            sys.exit(1)
+
+        main_loop_movie(systems, pbcs)
+
+    else:
+        if input_filename.split(".")[-1] == "xyz":
+            file = open(input_filename, "r")
+            system, pbc = read_xyz(file)
+            file.close()
+        elif (
+            input_filename.split(".")[-1] == "pdb"
+            or input_filename.split(".")[-1] == "ent"
+        ):
+            file = open(input_filename, "r")
+            system, pbc = read_pdb(file)
+            file.close()
+        else:
+            sys.exit(1)
+
+        if pbc is None:
+            while True:
+                try:
+                    a = input(
+                        f"Cell information not found in {input_filename}"
+                        "Enter cell information\n"
+                        "a>     "
+                    )
+                    a = float(a)
+                    b = input("b>     ")
+                    b = float(b)
+                    c = input("c>     ")
+                    c = float(c)
+                    alpha = input("alpha> ")
+                    alpha = float(alpha)
+                    beta = input("beta>  ")
+                    beta = float(beta)
+                    gamma = input("gamma> ")
+                    gamma = float(gamma)
+                    break
+                except ValueError:
+                    print("!!! Error converting input to float !!!\n")
+            pbc = PBC(a, b, c, alpha, beta, gamma)
+
+        main_loop_single(system, pbc)
+
+
 if __name__ == "__main__":
-    main_loop()
-    exit(0)
+    load_file_and_run_menu()
+    sys.exit()
