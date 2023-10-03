@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 #
-# PDB Wizard v0.4.0
+# PDB Wizard v0.3.1
 # copyright Adam Hogan 2021-2023
 #
 #    This program is free software: you can redistribute it and/or modify
@@ -1392,7 +1392,9 @@ def print_info_movie(systems: list[list[Atom]], pbcs: list[PBC], filename: str) 
     print(r"/ ___/ /_// \/  \  \  /\  /| |/ / (_| | | | (_| |")
     print(r"\/  /___,'\_____/   \/  \/ |_/___\__,_|_|  \__,_|")
     print("")
-    print(f"Trajectory detected\n{len(systems)} frames\nExtract a single frame for more detailed options")
+    print(
+        f"Trajectory detected\n{len(systems)} frames\nExtract a single frame for more detailed options"
+    )
 
 
 def print_formula_unit(system: list[Atom]) -> None:
@@ -1778,21 +1780,30 @@ def write_mpmc_options(system: list[Atom], pbc: PBC) -> None:
     )
 
 
+def list_molecules(system: list[Atom], pbc: PBC) -> None:
+    mols = find_molecules(system, pbc)
+    for mol in mols:
+        mol.sort(key=lambda atom: atom.atomic_number, reverse=True)
+        elements = [atom.element for atom in mol]
+        print("".join(elements))
+
+
 def menu_single_geom_analysis(system: list[Atom], pbc: PBC) -> tuple[list[Atom], PBC]:
     while True:
         option = 0
         try:
             option = input(
-                "\nWhat would you like to do?\n\n\
-                1 = list bonds\n\
-                2 = list close vdw contacts\n\
-                3 = list angles\n\
-                4 = list lone atoms\n\
-                5 = delete lone atoms\n\
-                6 = list coordinates\n\
-                7 = edit hydrogen bond distances\n\
-                8 = preview with VMD\n\
-                0 = back to main menu\n\n> "
+                "\nWhat would you like to do?\n\n"
+                "1 = list bonds\n"
+                "2 = list close vdw contacts\n"
+                "3 = list angles\n"
+                "4 = list lone atoms\n"
+                "5 = delete lone atoms\n"
+                "6 = list molecules\n"
+                "7 = list coordinates\n"
+                "8 = edit hydrogen bond distances\n"
+                "9 = preview with VMD\n"
+                "0 = back to main menu\n\n> "
             )
             option = int(option)
         except ValueError:
@@ -1808,10 +1819,12 @@ def menu_single_geom_analysis(system: list[Atom], pbc: PBC) -> tuple[list[Atom],
         elif option == 5:
             system = delete_lone_atoms(system, pbc)
         elif option == 6:
-            list_coords(system)
+            list_molecules(system, pbc)
         elif option == 7:
-            system = edit_h_dist(system, pbc)
+            list_coords(system)
         elif option == 8:
+            system = edit_h_dist(system, pbc)
+        elif option == 9:
             vmd_preview(system, pbc)
         elif option == 0:
             return system, pbc
@@ -1994,7 +2007,9 @@ def menu_movie_create_movie(systems: list[list[Atom]], pbcs: list[PBC]) -> None:
         write_xyz(system, pbc, out)
     out.close()
     os.system("vmd vmd_movie_tmp/out.xyz -e vmd_movie_tmp/vmd_commands")
-    os.system("ffmpeg -framerate 30 -pattern_type glob -i 'vmd_movie_tmp/*.png' -c:v libx264 -pix_fmt yuv420p vmd_movie_tmp/out.mp4")
+    os.system(
+        "ffmpeg -framerate 30 -pattern_type glob -i 'vmd_movie_tmp/*.png' -c:v libx264 -pix_fmt yuv420p vmd_movie_tmp/out.mp4"
+    )
 
 
 def main_loop_movie(systems: list[list[Atom]], pbcs: list[PBC]) -> None:
