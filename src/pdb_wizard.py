@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 #
-# PDB Wizard v0.3.1
+# PDB Wizard v0.4.0
 # copyright Adam Hogan 2021-2023
 #
 #    This program is free software: you can redistribute it and/or modify
@@ -1994,7 +1994,7 @@ def menu_movie_create_movie(systems: list[list[Atom]], pbcs: list[PBC]) -> None:
         write_xyz(system, pbc, out)
     out.close()
     os.system("vmd vmd_movie_tmp/out.xyz -e vmd_movie_tmp/vmd_commands")
-    os.system("ffmpeg -framerate 30 -pattern_type glob -i '*.png' -c:v libx264 -pix_fmt yuv420p vmd_movie_tmp/out.mp4")
+    os.system("ffmpeg -framerate 30 -pattern_type glob -i 'vmd_movie_tmp/*.png' -c:v libx264 -pix_fmt yuv420p vmd_movie_tmp/out.mp4")
 
 
 def main_loop_movie(systems: list[list[Atom]], pbcs: list[PBC]) -> None:
