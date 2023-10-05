@@ -18,8 +18,15 @@ if [ ! -f entry.txt ] ;
 then
     echo -e "${bold}${red}You have not made an entry yet, so there is not one to update. Use command 'ce' to create an entry.${reset}"
 else
-program=`grep "Program |" entry.txt | awk '{print $4}'`
-
+    program=`grep "Program |" entry.txt | awk '{print $4}'`
+    directory=`pwd`
+    entry_num=`grep "ENTRY #" entry.txt | awk '{print $3}'`
+    old_wd=`grep "Working Directory:" entry.txt | awk '{print $3}'`
+    if [ ! "$old_wd" == $directory ] ;
+    then
+        echo "${yellow}${bold}Entry $entry_num was moved since last update. Updating working directory.${reset}"
+        sed -i "s;Working Directory.*;Working Directory: $directory;g" entry.txt
+    fi
 
 #-------------------------------------------------------------------------------------------------------------BUILD VARIABLES BASED ON PROGRAM
 
@@ -133,6 +140,12 @@ then
     then
             echo "${bold}${red}You have not made an entry yet, so there is not one to update. Use command 'ce' to create an entry.${reset}"
     else
+            old_wd=`grep "Working Directory:" entry.txt | awk '{print $3}'`
+            if [ ! "$old_wd" == $directory ] ;
+            then
+                    echo "Entry $entry_num was moved since last update. Updating working directory."
+                    sed -i "s;Working Directory.*;Working Directory: $directory;g" entry.txt
+            fi
             if test -z runlog.log ;
             then
                 echo "${bold}${red}The job has not started yet. Wait for a runlog to be generated.${reset}"
@@ -151,12 +164,14 @@ then
                 sed -i "s/Final Energy.*/Final Energy: $final_energy_au a.u. or $final_energy_eV eV/g" entry.txt
                 if [ "$job_type" == "GEO_OPT" ] ;
                 then
+                    sed -i "s/Information for last completed step.*/Information for last completed step (Step $total_steps)/g" entry.txt
                     sed -i "s/Final Cell Lengths.*/Final Cell Lengths (Angstrom): $final_cell_lengths/g" entry.txt
                     sed -i "s/Final Cell Angles.*/Final Cell Angles (alpha beta gamma): $final_cell_angles/g" entry.txt
                     sed -i "s/Final Cell Volume.*/Final Cell Volume (Angstrom^3): $final_cell_volume/g" entry.txt
                 fi                
                 if [ "$job_type" == "CELL_OPT" ] ;
                 then
+                    sed -i "s/Information for last completed step.*/Information for last completed step (Step $total_steps)/g" entry.txt
                     sed -i "s/Final Cell Lengths.*/Final Cell Lengths (Angstrom): $final_cell_lengths/g" entry.txt
                     sed -i "s/Final Cell Angles.*/Final Cell Angles (alpha beta gamma): $final_cell_angles/g" entry.txt
                     sed -i "s/Final Cell Volume.*/Final Cell Volume (Angstrom^3): $final_cell_volume/g" entry.txt
