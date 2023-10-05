@@ -140,12 +140,6 @@ then
     then
             echo "${bold}${red}You have not made an entry yet, so there is not one to update. Use command 'ce' to create an entry.${reset}"
     else
-            old_wd=`grep "Working Directory:" entry.txt | awk '{print $3}'`
-            if [ ! "$old_wd" == $directory ] ;
-            then
-                    echo "Entry $entry_num was moved since last update. Updating working directory."
-                    sed -i "s;Working Directory.*;Working Directory: $directory;g" entry.txt
-            fi
             if test -z runlog.log ;
             then
                 echo "${bold}${red}The job has not started yet. Wait for a runlog to be generated.${reset}"
