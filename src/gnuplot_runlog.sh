@@ -1,5 +1,5 @@
 #!/bin/bash
-#Script by Angela Shipman, v1 Sep 18 2023
+#Script by Angela Shipman, v2 Oct 9 2023
 
 #Pretty Formatting
 #COLORS
