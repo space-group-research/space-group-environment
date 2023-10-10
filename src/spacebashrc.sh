@@ -1,5 +1,6 @@
 #!/usr/bin/bash
 
+
 # --- Exit early if not interactive ---
 [[ $- == *i* ]] || return
 
@@ -100,6 +101,30 @@ ae() { #Compile all entries into one file
         export entry_path
         sh $entry_path/var_storage.sh
         sh $entry_path/ae.sh
+}
+
+# --- File Management ---
+
+deletecorefiles(){
+        find -type f -name 'core.*'
+        echo -e "THE ABOVE FILES WILL BE DELETED. CONTINUE? ( Y or N )?"
+        read answer1
+        case $answer1 in
+                Yes | Y )
+                        echo -e "ARE YOU SURE? ಠ_ಠ ( Y or N )?"
+                        read answer2
+                        case $answer2 in
+                                Yes | Y )
+                                        find -type f -name 'core.*' -delete
+                                        echo "CORE FILES DELETED."
+                                ;;
+                                No | N )
+                                ;;
+                        esac
+                        ;;
+                No | N )
+                        ;;
+        esac
 }
 
 
