@@ -32,6 +32,8 @@ export PATH=$PATH:~/bin
 alias pdbwizard="python3 ~/bin/pdb_wizard.py"
 alias pdb_wizard="python3 ~/bin/pdb_wizard.py"
 alias plot='bash ~/bin/gnuplot_runlog.sh'
+alias binding_energy='bash ~/bin/be_calc_submit.sh'
+alias be_calc='bash ~/bin/be_calc_submit.sh'
 alias bashrc='vim ~/.bashrc'
 alias bashup='source ~/.bashrc'
 
