@@ -24,6 +24,15 @@ if [ $hostsystem = 'hazel' ]
 then
     echo "~/bin/touch"
     gcc src/touch.c -o ~/bin/touch
+
+    echo "~/be_calc_submit_hazel.sh"
+    cp src/be_calc_submit_hazel.sh ~/bin
+fi
+
+if [ $hostsystem = 'bridges2' ]
+then
+    echo "~/be_calc_submit_bridges.sh"
+    cp src/be_calc_submit_bridges.sh ~/bin
 fi
 
 echo "~/pdb_wizard.py"
