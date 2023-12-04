@@ -32,8 +32,6 @@ export PATH=$PATH:~/bin
 alias pdbwizard="python3 ~/bin/pdb_wizard.py"
 alias pdb_wizard="python3 ~/bin/pdb_wizard.py"
 alias plot='bash ~/bin/gnuplot_runlog.sh'
-alias binding_energy='bash ~/bin/be_calc_submit.sh'
-alias be_calc='bash ~/bin/be_calc_submit.sh'
 alias bashrc='vim ~/.bashrc'
 alias bashup='source ~/.bashrc'
 
@@ -192,6 +190,8 @@ then
 
     export WORK="/ocean/projects/che220043p"
     alias cdw='cd $WORK'
+    alias be_calc='sh ~/bin/be_calc_submit_bridges.sh'
+    alias binding_energy='sh ~/bin/be_calc_submit_bridges.sh'
     
     # Print job ID and directory
     bjobsdir() {
@@ -216,6 +216,8 @@ then
     alias space='qstat -a space'
     alias job_count='qstat -a | grep -c $USER'
     alias touch=~/bin/touch
+    alias be_calc='sh ~/bin/be_calc_submit_hazel.sh'
+    alias binding_energy='sh ~/bin/be_calc_submit_hazel.sh'
     
     # Print job ID and directory
     bjobsdir() {
