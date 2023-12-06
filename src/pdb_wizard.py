@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 #
-# PDB Wizard v0.3.1
+# PDB Wizard v0.3.2
 # copyright Adam Hogan 2021-2023
 #
 #    This program is free software: you can redistribute it and/or modify
@@ -1682,15 +1682,15 @@ def write_mpmc_options(system: list[Atom], pbc: PBC) -> None:
 
     while True:
         try:
-            write_charges = input(
+            write_charges_in: str = input(
                 "\nWould you like to read in charges?\n"
                 "('yes', 'y', 1 or 'no', 'n', 0)\n\n> "
             )
-            if write_charges == "yes" or write_charges == "y":
+            if write_charges_in == "yes" or write_charges_in == "y":
                 write_charges = 1
-            if write_charges == "no" or write_charges == "n":
+            if write_charges_in == "no" or write_charges_in == "n":
                 write_charges = 0
-            write_charges = int(write_charges)
+            write_charges = int(write_charges_in)
             if write_charges > 1 or write_charges < 0:
                 raise ValueError
             break
@@ -1730,15 +1730,15 @@ def write_mpmc_options(system: list[Atom], pbc: PBC) -> None:
 
     while True:
         try:
-            write_force_field = input(
+            write_force_field_in: str = input(
                 "\nWould you like to automatically apply a forcefield to this MPMC .pbd file?\n"
                 "('yes', 'y', 1 or 'no', 'n', 0)\n\n> "
             )
-            if write_force_field == "yes" or write_force_field == "y":
+            if write_force_field_in == "yes" or write_force_field_in == "y":
                 write_force_field = 1
-            if write_force_field == "no" or write_force_field == "n":
+            if write_force_field_in == "no" or write_force_field_in == "n":
                 write_force_field = 0
-            write_force_field = int(write_force_field)
+            write_force_field = int(write_force_field_in)
             if write_force_field > 1 or write_force_field < 0:
                 raise ValueError
             break
@@ -1748,15 +1748,15 @@ def write_mpmc_options(system: list[Atom], pbc: PBC) -> None:
     if write_force_field == 1:
         while True:
             try:
-                force_field = input(
+                force_field_in: str = input(
                     "\nWhich force field?\n"
                     "valid answers are 'OPLSAA' (0) or 'PHAHST' (1)\n\n> "
                 )
-                if force_field == "OPLSAA":
+                if force_field_in == "OPLSAA":
                     force_field = 0
-                if force_field == "PHAHST":
+                if force_field_in == "PHAHST":
                     force_field = 1
-                force_field = int(force_field)
+                force_field = int(force_field_in)
                 if force_field > 1 or force_field < 0:
                     raise ValueError
                 apply_ff_to_system(system, get_forcefield(force_field))
@@ -2008,7 +2008,8 @@ def menu_movie_create_movie(systems: list[list[Atom]], pbcs: list[PBC]) -> None:
     out.close()
     os.system("vmd vmd_movie_tmp/out.xyz -e vmd_movie_tmp/vmd_commands")
     os.system(
-        "ffmpeg -framerate 30 -pattern_type glob -i 'vmd_movie_tmp/*.png' -c:v libx264 -pix_fmt yuv420p vmd_movie_tmp/out.mp4"
+        "ffmpeg -framerate 30 -pattern_type glob -i 'vmd_movie_tmp/*.png'"
+        " -c:v libx264 -pix_fmt yuv420p vmd_movie_tmp/out.mp4"
     )
 
 
@@ -2042,9 +2043,9 @@ def main_loop_single(system: list[Atom], pbc: PBC) -> None:
 
     while True:
         print_info(system, pbc, sys.argv[1])
-        option = -1
+        option: int = -1
         try:
-            option = input(
+            option_in: str = input(
                 "\nWhat would you like to do?\n\n"
                 "1 = geometry analysis\n"
                 "2 = extend axis, wrap, or sort\n"
@@ -2052,7 +2053,7 @@ def main_loop_single(system: list[Atom], pbc: PBC) -> None:
                 "4 = update unit cell\n"
                 "0 = quit\n\n> "
             )
-            option = int(option)
+            option = int(option_in)
         except ValueError:
             print("!!! Error converting input to int !!!")
         if option == 1:
@@ -2109,14 +2110,62 @@ def check_pdb_trajectory(filename: str) -> bool:
         return False
 
 
-def read_xyz_trajectory(file) -> tuple[list[list[Atom]], list[Optional[PBC]]]:
-    systems = []
-    pbcs = []
+def read_xyz_trajectory(file: TextIO) -> tuple[list[list[Atom]], list[Optional[PBC]]]:
+    systems: list[list[Atom]] = []
+    pbcs: list[Optional[PBC]] = []
+
+    line = file.readline()
+
+    try:
+        while line != "" and line != "\n":
+            n_atoms: int = int(line)
+            pbc: Optional[PBC] = None
+            system: list[Atom] = []
+            line = file.readline()
+            try:
+                tokens = line.split()
+                if len(tokens) != 6:
+                    raise ValueError
+                a = float(tokens[0])
+                b = float(tokens[1])
+                c = float(tokens[2])
+                alpha = float(tokens[3])
+                beta = float(tokens[4])
+                gamma = float(tokens[5])
+                pbc = PBC(a, b, c, alpha, beta, gamma)
+            except ValueError:
+                print("Couldn't locate a b c alpha beta gamma on second line of .xyz file")
+                pass
+
+            try:
+                for _ in range(n_atoms):
+                    line = file.readline()
+                    tokens = line.split()
+                    atom = Atom(tokens[1], tokens[2], tokens[3], tokens[0])
+
+                    # attempt to read the fifth column as the charge, pass otherwise
+                    try:
+                        charge = tokens[4]
+                        atom.charge = float(charge)
+                    except (ValueError, IndexError):
+                        pass
+
+                    system.append(atom)
+
+            except ValueError:
+                sys.exit(f"Error reading line {line}")
+
+            systems.append(system)
+            pbcs.append(pbc)
+            line = file.readline()
+
+    except ValueError:
+        sys.exit("Error reading file")
 
     return systems, pbcs
 
 
-def read_pdb_trajectory(file) -> tuple[list[list[Atom]], list[Optional[PBC]]]:
+def read_pdb_trajectory(file: TextIO) -> tuple[list[list[Atom]], list[Optional[PBC]]]:
     systems = []
     pbcs = []
 
