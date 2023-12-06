@@ -1598,7 +1598,6 @@ def menu_move_extend_axis(
 
         for atom in new_atoms:
             system.append(atom)
-
         if axis == 0:
             pbc.update(
                 (times + 1) * pbc.a, pbc.b, pbc.c, pbc.alpha, pbc.beta, pbc.gamma
@@ -1612,7 +1611,6 @@ def menu_move_extend_axis(
                 pbc.a, pbc.b, (times + 1) * pbc.c, pbc.alpha, pbc.beta, pbc.gamma
             )
         set_atom_ids(system)
-
     return systems, pbcs
 
 
@@ -2114,6 +2112,8 @@ def read_xyz_trajectory(file: TextIO) -> tuple[list[list[Atom]], list[Optional[P
     systems: list[list[Atom]] = []
     pbcs: list[Optional[PBC]] = []
 
+    default_pbc = None
+
     line = file.readline()
 
     try:
@@ -2134,8 +2134,11 @@ def read_xyz_trajectory(file: TextIO) -> tuple[list[list[Atom]], list[Optional[P
                 gamma = float(tokens[5])
                 pbc = PBC(a, b, c, alpha, beta, gamma)
             except ValueError:
-                print("Couldn't locate a b c alpha beta gamma on second line of .xyz file")
-                pass
+                if default_pbc is None:
+                    print("Couldn't locate a b c alpha beta gamma on second line of .xyz file")
+                    default_pbc = PBC(1000000, 1000000, 1000000, 90, 90, 90)
+                    default_pbc = menu_single_update_pbc(default_pbc)
+                pbc = copy.deepcopy(default_pbc)
 
             try:
                 for _ in range(n_atoms):
