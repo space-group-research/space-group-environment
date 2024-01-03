@@ -404,7 +404,7 @@ class Atom:
                 print(f"!!! Invalid element {name} !!!")
 
         if element == "H":
-            self.bond_r = 0.8
+            self.bond_r = 0.9
             self.vdw = 1.2
         elif element == "O":
             self.bond_r = 1.3
