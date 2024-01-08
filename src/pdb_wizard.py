@@ -1103,6 +1103,7 @@ def write_xyz(system: list[Atom], pbc: PBC, out: TextIO) -> None:
 
 
 def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO) -> None:
+    system = sort(system, pbc)
     mols = find_molecules(system, pbc)
 
     out.write("MODEL        1\n")
@@ -1284,6 +1285,7 @@ def write_mpmc_pdb(
     write_charges: bool = False,
     write_params: bool = False,
 ) -> None:
+    system = sort(system, pbc)
     out = open(filename, "w")
     out.write(
         f"CRYST1  {round(pbc.a, 3):>7}  {round(pbc.b, 3):7}  {round(pbc.c, 3):7} "
