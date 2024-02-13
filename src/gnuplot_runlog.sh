@@ -18,7 +18,7 @@ echo -e "${cyan}Searching for ${bold}runlog.log${reset}${cyan} or ${bold}stdout.
 
 if [ ! -f runlog.log ] ;
 then
-	if [ ! -f stdout.* ];
+	if [ ! -f stdout.* ] &> /dev/null ;
 	then
 		echo -e "${red}No ${bold}runlog.log${reset}${red} or ${bold}stdout.*${reset}${red} file detected. Please ensure there is an output file in this directory.${reset}"
 		exit
@@ -29,7 +29,7 @@ fi
 if [ -f runlog.log ] ;
 then
 	output_file='runlog.log'
-elif [ -f stdout.* ] ;
+elif [ -f stdout.* ] &> /dev/null ;
 then
 	output_file='stdout.*'
 fi
