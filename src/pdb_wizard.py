@@ -20,6 +20,7 @@
 import copy
 import io
 import os
+import tempfile
 import sys
 from typing import Any, Iterator, Optional, TextIO
 
@@ -1710,6 +1711,25 @@ def write_mpmc_options(system: list[Atom], pbc: PBC) -> None:
             charges_filename = input("\ncharges file name > ")
             try:
                 charges = []
+                if charges_filename.endswith(".resp"):
+                    print("\nYou have entered a file ending with .resp. This program expects the resp format.")
+                    print("If you have a column of raw charges, use any other file extension name.\n")
+                    with tempfile.NamedTemporaryFile(mode='w+t', delete=False) as tmp:
+                        with open(charges_filename, "r") as file:
+                           # Skip the lines
+                            # RESP charges:
+                            # Type |   Atom   |    Charge
+                            next(file)
+                            next(file)
+                            for line in file:
+                                if line.strip():
+                                    words = line.split()
+                                    if words[0] == 'Total':
+                                        continue
+                                    tmp.write(words[-1] + '\n')
+
+                        charges_filename = tmp.name
+
                 for line in open(charges_filename, "r").readlines():
                     charges.append(float(line))
                 if len(charges) == len(system):
@@ -1718,8 +1738,8 @@ def write_mpmc_options(system: list[Atom], pbc: PBC) -> None:
                         atom.charge = charges[ind]
                 elif len(system) % len(charges) == 0:
                     print(
-                        "Number of charges a multiple of the number of atoms, applying charges recursively ..."
-                    )
+                            "Number of charges a multiple of the number of atoms, applying charges recursively ..."
+                            )
                     for ind, atom in enumerate(system):
                         i = ind % len(charges)
                         atom.charge = charges[i]
