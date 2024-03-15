@@ -1708,7 +1708,8 @@ def write_mpmc_options(system: list[Atom], pbc: PBC) -> None:
 
     if write_charges == 1:
         while True:
-            charges_filename = input("\ncharges file name > ")
+            print("\nEnter a resp file or a valid column of raw charges")
+            charges_filename = input("charges file name > ")
             try:
                 charges = []
                 if charges_filename.endswith(".resp"):
