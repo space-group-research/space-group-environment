@@ -1111,9 +1111,12 @@ def write_xyz(system: list[Atom], pbc: PBC, out: TextIO) -> None:
         out.write(f"{atom.element} {atom.x[0]} {atom.x[1]} {atom.x[2]}\n")
 
 
-def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO) -> None:
-    system = sort(system, pbc)
-    mols = find_molecules(system, pbc)
+def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO, skip_mols_step: bool = False) -> None:
+    if skip_mols_step:
+        mols = [system]
+    else:
+        system = sort(system, pbc)
+        mols = find_molecules(system, pbc)
 
     out.write("MODEL        1\n")
     out.write(f"COMPND    {'':<69}\n")
@@ -1125,29 +1128,34 @@ def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO) -> None:
 
     atom_id = 1
     for idx, mol in enumerate(mols):
-        mol.sort(key=lambda atom: atom.element)
         mol_name = "UNK"
+        
         mol_elements = [atom.element for atom in mol]
-        if mol_elements == ["H", "H", "O"]:
-            mol_name = "HOH"
-        elif mol_elements == ["H", "H"]:
-            mol_name = "H2"
-        elif mol_elements == ["H", "H", "H", "H", "C"]:
-            mol_name = "MET"
-        elif mol_elements == ["N", "N"]:
-            mol_name = "N2"
-        elif mol_elements == ["H", "H", "C", "C"]:
-            mol_name = "ACE"
-        elif mol_elements == ["H", "H", "H", "H", "C", "C"]:
-            mol_name = "ENE"
-        elif mol_elements == ["H", "H", "H", "H", "H", "H", "C", "C"]:
-            mol_name = "ETH"
-        elif mol_elements == ["Zn"]:
-            mol_name = "ZNA"
-        elif mol_elements == ["Cl", "Cl", "Cl", "Cl", "Zn"]:
-            mol_name = "ZNC"
-        elif len(mol_elements) == 1:
+        
+        if len(mol_elements) == 1:
             mol_name = mol_elements[0].upper()
+        
+        if not skip_mols_step:
+            mol.sort(key=lambda atom: atom.element)
+            mol_elements = [atom.element for atom in mol]
+            if mol_elements == ["H", "H", "O"]:
+                mol_name = "HOH"
+            elif mol_elements == ["H", "H"]:
+                mol_name = "H2"
+            elif mol_elements == ["H", "H", "H", "H", "C"]:
+                mol_name = "MET"
+            elif mol_elements == ["N", "N"]:
+                mol_name = "N2"
+            elif mol_elements == ["H", "H", "C", "C"]:
+                mol_name = "ACE"
+            elif mol_elements == ["H", "H", "H", "H", "C", "C"]:
+                mol_name = "ENE"
+            elif mol_elements == ["H", "H", "H", "H", "H", "H", "C", "C"]:
+                mol_name = "ETH"
+            elif mol_elements == ["Zn"]:
+                mol_name = "ZNA"
+            elif mol_elements == ["Cl", "Cl", "Cl", "Cl", "Zn"]:
+                mol_name = "ZNC"
 
         base_atom = mol[-1]
         additional_tag = 1
@@ -1175,17 +1183,6 @@ def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO) -> None:
 
             atom_id += 1
             additional_tag += 1
-
-    for idx, mol in enumerate(mols):
-        mol.sort(key=lambda atom: atom.element)
-
-        mol_elements = [atom.element for atom in mol]
-
-        if mol_elements == ["Cl", "Cl", "Cl", "Cl", "Zn"]:
-            out.write(f"CONECT {mol[0].id:>4} {mol[4].id:>4}\n")
-            out.write(f"CONECT {mol[1].id:>4} {mol[4].id:>4}\n")
-            out.write(f"CONECT {mol[2].id:>4} {mol[4].id:>4}\n")
-            out.write(f"CONECT {mol[3].id:>4} {mol[4].id:>4}\n")
 
     out.write("END\n")
     set_atom_ids(system)
@@ -1980,13 +1977,14 @@ def menu_movie_write_files(systems: list[list[Atom]], pbcs: list[PBC]) -> None:
                 "\nWhat would you like to do?\n\n"
                 "1 = write xyz file\n"
                 "2 = write standard PDB file\n"
+                "3 = write Xpress PDB file (no mol finding)\n"
                 "0 = back to main menu\n\n> "
             )
             option = int(option)
             if option == 1:
                 filename = input("\noutput filename > ")
                 out = open(filename, "w")
-                for system, pbc in zip(systems, pbcs):
+                for system, pbc in progressbar(list(zip(systems, pbcs)), "Writing frame "):
                     write_xyz(system, pbc, out)
                 out.close()
                 print(f"wrote {filename}")
@@ -1995,6 +1993,13 @@ def menu_movie_write_files(systems: list[list[Atom]], pbcs: list[PBC]) -> None:
                 out = open(filename, "w")
                 for system, pbc in zip(systems, pbcs):
                     write_standard_pdb(system, pbc, out)
+                out.close()
+                print(f"wrote {filename}")
+            elif option == 3:
+                filename = input("\noutput filename > ")
+                out = open(filename, "w")
+                for system, pbc in progressbar(list(zip(systems, pbcs)), "Writing frame "):
+                    write_standard_pdb(system, pbc, out, skip_mols_step=True)
                 out.close()
                 print(f"wrote {filename}")
             elif option == 0:
