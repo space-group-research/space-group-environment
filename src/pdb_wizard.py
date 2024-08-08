@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 #
-# PDB Wizard v0.3.2
-# copyright Adam Hogan 2021-2023
+# PDB Wizard v0.3.3
+# copyright Adam Hogan 2021-2024
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -2214,7 +2214,7 @@ def read_pdb_trajectory(file: TextIO) -> tuple[list[list[Atom]], list[Optional[P
     while line != "":
         line = file.readline()
         one_frame.seek(0)
-        if line[:6] == "MODEL " and len(one_frame.readlines()) > 1:
+        if line[:6] == "MODEL " and len(one_frame.readlines()) > 3:
             one_frame.seek(0)
             system, pbc = read_pdb(one_frame)
             systems.append(system)
@@ -2228,6 +2228,14 @@ def read_pdb_trajectory(file: TextIO) -> tuple[list[list[Atom]], list[Optional[P
     systems.append(system)
     pbcs.append(pbc)
     one_frame.close()
+    
+    for idx, pbc in enumerate(pbcs):
+        if pbc is None:
+            print(f"Couldn't locate a b c alpha beta gamma in frame {idx} of pdb file")
+            if idx == 0:
+                pbcs[idx] = PBC(1000000, 1000000, 1000000, 90, 90, 90)
+            else:
+                pbcs[idx] = copy.copy(pbcs[0])
 
     return systems, pbcs
 
