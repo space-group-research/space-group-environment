@@ -138,6 +138,7 @@ list_of_elements: list[str] = [
     "Zn",
     "Zr",
     "Da",
+    "X",
 ]
 
 element_masses: dict[str, float] = {
@@ -251,6 +252,7 @@ element_masses: dict[str, float] = {
     "Db": 262,
     "Sg": 263,
     "Da": 0,
+    "X": 0,
 }
 
 atomic_numbers: dict[str, int] = {
@@ -373,6 +375,7 @@ atomic_numbers: dict[str, int] = {
     "Ts": 117,
     "Og": 118,
     "Da": 0,
+    "X": 0,
 }
 
 
@@ -404,19 +407,6 @@ class Atom:
             if element not in list_of_elements:
                 print(f"!!! Invalid element {name} !!!")
 
-        if element == "H":
-            self.bond_r = 1.0
-            self.vdw = 1.2
-        elif element == "O":
-            self.bond_r = 1.3
-            self.vdw = 1.8
-        elif element == "N" or element == "C":
-            self.bond_r = 1.6
-            self.vdw = 2.0
-        else:
-            self.bond_r = 2.0
-            self.vdw = 3.0
-
         self.element = element
         self.charge = 0.0
         self.alpha = 0.0
@@ -428,6 +418,22 @@ class Atom:
         self.mass = element_masses[self.element]
         self.atomic_number = atomic_numbers[self.element]
         self.id = 0
+
+        if element == "H":
+            self.bond_r = 1.0
+            self.vdw = 1.2
+        elif element == "O":
+            self.bond_r = 1.3
+            self.vdw = 1.8
+        elif element == "N" or element == "C":
+            self.bond_r = 1.6
+            self.vdw = 2.0
+        elif self.atomic_number >= 11:
+            self.bond_r = 2.2
+            self.vdw = 3.4
+        else:
+            self.bond_r = 2.0
+            self.vdw = 3.0
 
     def __str__(self) -> str:
         return f"Atom instance {self.element} {self.id}"
@@ -893,7 +899,8 @@ def read_pdb(file: TextIO) -> tuple[list[Atom], Optional[PBC]]:
             # create atoms
             if tokens[0] == "ATOM" or tokens[0] == "HETATM":
                 atom = Atom(line[30:38], line[38:46], line[46:54], line[12:16])
-                system.append(atom)
+                if atom.atomic_number > 0:
+                    system.append(atom)
 
             # load box
             if tokens[0] == "CRYST1":
@@ -1166,8 +1173,10 @@ def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO, skip_mols_step
             other_elements = [
                 other_atom.element for other_atom in mol if atom is not other_atom
             ]
-            if atom.element in other_elements:
+            if atom.element in other_elements and not skip_mols_step:
                 atom.name = atom.element + str(additional_tag)
+            else:
+                atom.name = atom.element
 
             dx = atom.x - base_atom.x
 
@@ -1190,7 +1199,7 @@ def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO, skip_mols_step
 
 def find_molecules(system: list[Atom], pbc: PBC) -> list[list[Atom]]:
     set_atom_ids(system)
-    merge_lists = []
+    bonds = {}
     for atom1 in progressbar(system, "Finding molecules "):
         for atom2 in system:
             if atom2.id != atom1.id:
@@ -1198,66 +1207,50 @@ def find_molecules(system: list[Atom], pbc: PBC) -> list[list[Atom]]:
                 r = pbc.min_image(dx)
                 bond_r = 0.5 * (atom1.bond_r + atom2.bond_r)
                 if r < bond_r:
-                    found = False
-                    for merge_list in merge_lists:
-                        if atom1.id in merge_list:
-                            if atom2.id not in merge_list:
-                                merge_list.append(atom2.id)
-                            found = True
-                        elif atom2.id in merge_list:
-                            if atom1.id not in merge_list:
-                                merge_list.append(atom1.id)
-                            found = True
-                    if not found:
-                        merge_lists.append([atom1.id, atom2.id])
-
-    for atom in system:
-        lone = True
-        for merge_list in merge_lists:
-            if atom.id in merge_list:
-                lone = False
-        if lone:
-            merge_lists.append([atom.id])
-
-    merge_mol_lists = []
-
-    for idx1, merge_list1 in enumerate(merge_lists):
-        mol_already_in_merge = False
-        for mol_list in merge_mol_lists:
-            if idx1 in mol_list:
-                mol_already_in_merge = True
-
-        if mol_already_in_merge:
+                    if atom1.id not in bonds.keys():
+                        bonds[atom1.id] = [atom2.id]
+                    else:
+                        if atom2.id not in bonds[atom1.id]:
+                            bonds[atom1.id].append(atom2.id)
+                    if atom2.id not in bonds.keys():
+                        bonds[atom2.id] = [atom1.id]
+                    else:
+                        if atom1.id not in bonds[atom2.id]:
+                            bonds[atom2.id].append(atom1.id)
+    
+    mols_by_atom_id = []
+    
+    for atom1 in system:
+    
+        atom_already_in_mol = False
+        
+        for mol in mols_by_atom_id:
+            if atom1.id in mol:
+               atom_already_in_mol = True
+               
+        if atom_already_in_mol:
             continue
-
-        other_mols = [idx1]
-
-        for idx2, merge_list2 in enumerate(merge_lists):
-            if idx1 == idx2:
-                continue
-            for atom_id1 in merge_list1:
-                for atom_id2 in merge_list2:
-                    if atom_id1 == atom_id2:
-                        if idx2 not in other_mols:
-                            other_mols.append(idx2)
-                            continue
-
-        merge_mol_lists.append(other_mols)
-
-    final_merge_list = []
-
-    for mol_ids in merge_mol_lists:
-        atom_ids = []
-        for mol_id in mol_ids:
-            for atom_id in merge_lists[mol_id]:
-                atom_ids.append(atom_id)
-        atom_ids = list(set(atom_ids))
-        final_merge_list.append(atom_ids)
-
-    mols = [
-        [system[atom_id - 1] for atom_id in merge_list]
-        for merge_list in final_merge_list
-    ]
+        
+        if atom1.id not in bonds.keys():
+            mols_by_atom_id.append([atom1.id])
+            continue
+        
+        new_mol = [atom1.id]
+        
+        while True:
+            old_num_of_atoms_in_mol = len(new_mol)
+            
+            for current_id in new_mol:
+                for new_id in bonds[current_id]:
+                    if new_id not in new_mol:
+                        new_mol.append(new_id)
+            
+            if len(new_mol) == old_num_of_atoms_in_mol:
+                break
+        
+        mols_by_atom_id.append(new_mol)
+    
+    mols = [[system[atom_id-1] for atom_id in mol] for mol in mols_by_atom_id]
 
     return mols
 
@@ -1293,13 +1286,16 @@ def write_mpmc_pdb(
 ) -> None:
     system = sort(system, pbc)
     out = open(filename, "w")
+    out.write("MODEL        1\n")
+    out.write(f"COMPND    {'':<69}\n")
+    out.write("AUTHOR    GENERATED BY PDB WIZARD\n")
     out.write(
         f"CRYST1  {round(pbc.a, 3):>7}  {round(pbc.b, 3):7}  {round(pbc.c, 3):7} "
         f"{round(pbc.alpha, 2):>6} {round(pbc.beta, 2):>6} {round(pbc.gamma, 2):>6} P 1           1\n"
     )
-    for atom in progressbar(system):
+    for idx, atom in enumerate(progressbar(system)):
         out.write(
-            f"ATOM {atom.id:>6} {atom.element:<4} MOF F    1    "
+            f"ATOM {idx+1:>6} {atom.element:<4} MOF F    1    "
             f"{round(atom.x[0], 3):>7} {round(atom.x[1], 3):>7} {round(atom.x[2], 3):>7}"
         )
         if write_params is True:
@@ -1326,7 +1322,7 @@ def write_mpmc_pdb(
     for ind, pos in enumerate(borders):
         border_pos = np.matmul(pos, pbc.basis_matrix)
         out.write(
-            f"ATOM {len(system) + ind:>6} {'X':<4} BOX F    2    {round(border_pos[0], 3):>7} "
+            f"ATOM {len(system) + ind + 1:>6} {'X':<4} BOX F    2    {round(border_pos[0], 3):>7} "
             f"{round(border_pos[1], 3):>7} {round(border_pos[2], 3):>7} 0.0 0.0 0.0 0.0 0.0\n"
         )
     connections = [
@@ -1694,9 +1690,10 @@ def write_mpmc_options(system: list[Atom], pbc: PBC) -> None:
             )
             if write_charges_in == "yes" or write_charges_in == "y":
                 write_charges = 1
-            if write_charges_in == "no" or write_charges_in == "n":
+            elif write_charges_in == "no" or write_charges_in == "n":
                 write_charges = 0
-            write_charges = int(write_charges_in)
+            else:
+                write_charges = int(write_charges_in)
             if write_charges > 1 or write_charges < 0:
                 raise ValueError
             break
@@ -1762,9 +1759,10 @@ def write_mpmc_options(system: list[Atom], pbc: PBC) -> None:
             )
             if write_force_field_in == "yes" or write_force_field_in == "y":
                 write_force_field = 1
-            if write_force_field_in == "no" or write_force_field_in == "n":
+            elif write_force_field_in == "no" or write_force_field_in == "n":
                 write_force_field = 0
-            write_force_field = int(write_force_field_in)
+            else:
+                write_force_field = int(write_force_field_in)
             if write_force_field > 1 or write_force_field < 0:
                 raise ValueError
             break
@@ -1780,9 +1778,10 @@ def write_mpmc_options(system: list[Atom], pbc: PBC) -> None:
                 )
                 if force_field_in == "OPLSAA":
                     force_field = 0
-                if force_field_in == "PHAHST":
+                elif force_field_in == "PHAHST":
                     force_field = 1
-                force_field = int(force_field_in)
+                else:
+                    force_field = int(force_field_in)
                 if force_field > 1 or force_field < 0:
                     raise ValueError
                 apply_ff_to_system(system, get_forcefield(force_field))
@@ -2243,7 +2242,7 @@ def load_file_and_run_menu() -> None:
     if input_filename.split(".")[-1] == "xyz":
         is_trajectory = check_xyz_trajectory(input_filename)
     elif (
-        input_filename.split(".")[-1] == "pdb" or input_filename.split(".")[-1] == "ent"
+        input_filename.split(".")[-1] == "pdb" or input_filename.split(".")[-1] == "ent" or input_filename.split(".")[-1] == "pqr"
     ):
         is_trajectory = check_pdb_trajectory(input_filename)
     elif input_filename.split(".")[-1] == "cif":
@@ -2259,6 +2258,7 @@ def load_file_and_run_menu() -> None:
         elif (
             input_filename.split(".")[-1] == "pdb"
             or input_filename.split(".")[-1] == "ent"
+            or input_filename.split(".")[-1] == "pqr"
         ):
             file = open(input_filename, "r")
             systems, pbcs = read_pdb_trajectory(file)
@@ -2276,6 +2276,7 @@ def load_file_and_run_menu() -> None:
         elif (
             input_filename.split(".")[-1] == "pdb"
             or input_filename.split(".")[-1] == "ent"
+            or input_filename.split(".")[-1] == "pqr"
         ):
             file = open(input_filename, "r")
             system, pbc = read_pdb(file)
