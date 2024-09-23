@@ -76,7 +76,7 @@ read num_guests
 echo -e "\n${green}For a lone ${bold}$guest${reset}${green} molecule, what is it's ${bold}multiplicity? Type an integer.${reset}${green} \ne.g. H2O has multiplicity of 1."
 read guest_multiplicity
 
-echo -e "\n${yellow}What ${bold}elements${reset}${yellow} is your host made of (negate ${bold}$guest${reset}${yellow} atoms)? ${bold}Type in elements separated by spaces,${reset}${yellow} and match the case sensitivity of the elements listed in your input script. e.g. H O C N Cu"
+echo -e "\n${yellow}What ${bold}elements${reset}${yellow} is your host AND guest made of (INCLUDE ${bold}$guest${reset}${yellow} atoms)? ${bold}Type in elements separated by spaces,${reset}${yellow} and match the case sensitivity of the elements listed in your input script. e.g. H O C N Cu"
 read atoms1_mof
 
 total_jobs=$(( $num_guests + 2 ))
@@ -118,7 +118,7 @@ for ((i=$base; i<=$total_lines; i++));
 do
 	for elem in $guest_elements2;
 	do
-		sed -i "${i}s/ ${elem} / ${elem}_ghost /g" *.xyz
+		sed -i "${i}s/${elem} /${elem}_ghost /g" *.xyz
 	done
 done
 sed -i "s/#SBATCH --job-name=.*/#SBATCH --job-name=\"host_real\"/g" $submit_script
@@ -130,7 +130,7 @@ cp *.xyz all_ghost.xyz
 
 for i in $atoms2_mof;
 do
-	sed -i "s/ $i / ${i}_ghost /g" all_ghost.xyz
+	sed -i "s/$i /${i}_ghost /g" all_ghost.xyz
 done
 
 #Update input script for guests with multiplicity:
@@ -158,7 +158,7 @@ do
 		line_guest=$(( $base_skip - $x + 1 ))
 		for elem in $guest_elements2;
 		do
-			sed -i "${line_guest}s/ ${elem}_ghost / ${elem} /g" all_ghost.xyz
+			sed -i "${line_guest}s/${elem}_ghost /${elem} /g" all_ghost.xyz
 		done
 	done
 
