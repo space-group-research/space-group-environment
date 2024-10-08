@@ -1298,9 +1298,8 @@ def write_mpmc_pdb(
             f"ATOM {idx+1:>6} {atom.element:<4} MOF F    1    "
             f"{round(atom.x[0], 3):>7} {round(atom.x[1], 3):>7} {round(atom.x[2], 3):>7}"
         )
-        if write_params is True:
+        if write_params is True or write_params is True:
             out.write(f" {atom.mass:>9.6}")
-        if write_charges is True or write_params is True:
             out.write(f" {atom.charge:>8.4}")
         if write_params is True:
             out.write(
