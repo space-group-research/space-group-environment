@@ -420,20 +420,26 @@ class Atom:
         self.id = 0
 
         if element == "H":
-            self.bond_r = 1.0
+            self.bond_r = 0.8
             self.vdw = 1.2
-        elif element == "O":
-            self.bond_r = 1.3
-            self.vdw = 1.8
-        elif element == "N" or element == "C":
-            self.bond_r = 1.6
+        elif self.atomic_number <= 5: # He - B
+            self.bond_r = 1.2
+            self.vdw = 1.6
+        elif self.atomic_number <= 7: # C - N
+            self.bond_r = 1.7
             self.vdw = 2.0
-        elif self.atomic_number >= 11:
-            self.bond_r = 2.2
-            self.vdw = 3.4
+        elif self.atomic_number <= 9: # O - F
+            self.bond_r = 1.5
+            self.vdw = 1.8
+        elif self.atomic_number <= 13: # Ne - Al
+            self.bond_r = 1.2
+            self.vdw = 1.8
+        elif self.atomic_number <= 17: # Si - Cl
+            self.bond_r = 1.8
+            self.vdw = 2.2
         else:
-            self.bond_r = 2.0
-            self.vdw = 3.0
+            self.bond_r = 1.8 # Ar - All
+            self.vdw = 2.4
 
     def __str__(self) -> str:
         return f"Atom instance {self.element} {self.id}"
