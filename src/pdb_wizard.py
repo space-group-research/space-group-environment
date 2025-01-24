@@ -1204,61 +1204,86 @@ def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO, skip_mols_step
 
 
 def find_molecules(system: list[Atom], pbc: PBC) -> list[list[Atom]]:
-    set_atom_ids(system)
-    bonds = {}
-    for atom1 in progressbar(system, "Finding molecules "):
-        for atom2 in system:
-            if atom2.id != atom1.id:
-                dx = atom1.x - atom2.x
-                r = pbc.min_image(dx)
-                bond_r = 0.5 * (atom1.bond_r + atom2.bond_r)
-                if r < bond_r:
-                    if atom1.id not in bonds.keys():
-                        bonds[atom1.id] = [atom2.id]
-                    else:
-                        if atom2.id not in bonds[atom1.id]:
-                            bonds[atom1.id].append(atom2.id)
-                    if atom2.id not in bonds.keys():
-                        bonds[atom2.id] = [atom1.id]
-                    else:
-                        if atom1.id not in bonds[atom2.id]:
-                            bonds[atom2.id].append(atom1.id)
-    
-    mols_by_atom_id = []
-    
-    for atom1 in system:
-    
-        atom_already_in_mol = False
+    try:
+        import graph_tool.all as gt
         
-        for mol in mols_by_atom_id:
-            if atom1.id in mol:
-               atom_already_in_mol = True
-               
-        if atom_already_in_mol:
-            continue
+        i_idx, j_idx = np.triu_indices(len(system), k=1)
         
-        if atom1.id not in bonds.keys():
-            mols_by_atom_id.append([atom1.id])
-            continue
+        coords = np.array([atom.x for atom in system])
+        dx = coords[i_idx] - coords[j_idx]
+        rs = np.linalg.norm(dx - np.matmul(np.round(np.matmul(dx, pbc.reciprocal_basis_matrix)), pbc.basis_matrix), axis=1)
         
-        new_mol = [atom1.id]
-        
-        while True:
-            old_num_of_atoms_in_mol = len(new_mol)
-            
-            for current_id in new_mol:
-                for new_id in bonds[current_id]:
-                    if new_id not in new_mol:
-                        new_mol.append(new_id)
-            
-            if len(new_mol) == old_num_of_atoms_in_mol:
-                break
-        
-        mols_by_atom_id.append(new_mol)
-    
-    mols = [[system[atom_id-1] for atom_id in mol] for mol in mols_by_atom_id]
+        bond_rs = np.array([atom.bond_r for atom in system], dtype=float)
+        mixed_bond_rs = 0.5 * (bond_rs[i_idx] + bond_rs[j_idx])
 
-    return mols
+        bond_mask = mixed_bond_rs > rs
+        edge_list = np.stack((i_idx[bond_mask], j_idx[bond_mask]), axis=1)
+        
+        g = gt.Graph(g=len(system), directed=False)
+        g.add_edge_list(edge_list)
+        comp, hist = gt.label_components(g)
+        mol_labels = np.array(comp.a)
+        n_mols = np.max(mol_labels) + 1
+        
+        return [[x for x, y in zip(system, mol_labels==mol_idx) if y] for mol_idx in range(n_mols)]
+        
+    except ImportError:
+            print("Install graph_tool if you need this to be faster")
+            set_atom_ids(system)
+            bonds = {}
+            for atom1 in progressbar(system, "Finding molecules "):
+                for atom2 in system:
+                    if atom2.id != atom1.id:
+                        dx = atom1.x - atom2.x
+                        r = pbc.min_image(dx)
+                        bond_r = 0.5 * (atom1.bond_r + atom2.bond_r)
+                        if r < bond_r:
+                            if atom1.id not in bonds.keys():
+                                bonds[atom1.id] = [atom2.id]
+                            else:
+                                if atom2.id not in bonds[atom1.id]:
+                                    bonds[atom1.id].append(atom2.id)
+                            if atom2.id not in bonds.keys():
+                                bonds[atom2.id] = [atom1.id]
+                            else:
+                                if atom1.id not in bonds[atom2.id]:
+                                    bonds[atom2.id].append(atom1.id)
+            
+            mols_by_atom_id = []
+            
+            for atom1 in system:
+            
+                atom_already_in_mol = False
+                
+                for mol in mols_by_atom_id:
+                    if atom1.id in mol:
+                       atom_already_in_mol = True
+                       
+                if atom_already_in_mol:
+                    continue
+                
+                if atom1.id not in bonds.keys():
+                    mols_by_atom_id.append([atom1.id])
+                    continue
+                
+                new_mol = [atom1.id]
+                
+                while True:
+                    old_num_of_atoms_in_mol = len(new_mol)
+                    
+                    for current_id in new_mol:
+                        for new_id in bonds[current_id]:
+                            if new_id not in new_mol:
+                                new_mol.append(new_id)
+                    
+                    if len(new_mol) == old_num_of_atoms_in_mol:
+                        break
+                
+                mols_by_atom_id.append(new_mol)
+            
+            mols = [[system[atom_id-1] for atom_id in mol] for mol in mols_by_atom_id]
+
+            return mols
 
 
 def apply_ff_to_system(system: list[Atom], ff) -> list[Atom]:
