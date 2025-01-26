@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 #
-# PDB Wizard v0.3.3
-# copyright Adam Hogan 2021-2024
+# PDB Wizard v0.4.0
+# copyright Adam Hogan 2021-2025
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -618,6 +618,13 @@ class PBC:
         dx_return = dx - di
         return dx_return
 
+    def get_all_rs_min_image(self, system: list[Atom]) -> np.ndarray:
+        i_idx, j_idx = np.triu_indices(len(system), k=1)
+        coords = np.array([atom.x for atom in system])
+        dx = coords[i_idx] - coords[j_idx]
+        rs = np.linalg.norm(dx - np.matmul(np.round(np.matmul(dx, self.reciprocal_basis_matrix)), self.basis_matrix), axis=1)
+        return i_idx, j_idx, rs
+
 
 def progressbar(
     it: list, prefix: str = "", size: int = 60, out: TextIO = sys.stdout
@@ -1128,7 +1135,7 @@ def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO, skip_mols_step
     if skip_mols_step:
         mols = [system]
     else:
-        system = sort(system, pbc)
+        system = sort(system, pbc, output=False)
         mols = find_molecules(system, pbc)
 
     out.write("MODEL        1\n")
@@ -1204,20 +1211,17 @@ def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO, skip_mols_step
 
 
 def find_molecules(system: list[Atom], pbc: PBC) -> list[list[Atom]]:
+
+    i_idxs, j_idxs, rs = pbc.get_all_rs_min_image(system)
+
+    bond_rs = np.array([atom.bond_r for atom in system], dtype=float)
+    mixed_bond_rs = 0.5 * (bond_rs[i_idxs] + bond_rs[j_idxs])
+
+    bond_mask = mixed_bond_rs > rs
+    edge_list = np.stack((i_idxs[bond_mask], j_idxs[bond_mask]), axis=1)
+
     try:
         import graph_tool.all as gt
-        
-        i_idx, j_idx = np.triu_indices(len(system), k=1)
-        
-        coords = np.array([atom.x for atom in system])
-        dx = coords[i_idx] - coords[j_idx]
-        rs = np.linalg.norm(dx - np.matmul(np.round(np.matmul(dx, pbc.reciprocal_basis_matrix)), pbc.basis_matrix), axis=1)
-        
-        bond_rs = np.array([atom.bond_r for atom in system], dtype=float)
-        mixed_bond_rs = 0.5 * (bond_rs[i_idx] + bond_rs[j_idx])
-
-        bond_mask = mixed_bond_rs > rs
-        edge_list = np.stack((i_idx[bond_mask], j_idx[bond_mask]), axis=1)
         
         g = gt.Graph(g=len(system), directed=False)
         g.add_edge_list(edge_list)
@@ -1225,30 +1229,31 @@ def find_molecules(system: list[Atom], pbc: PBC) -> list[list[Atom]]:
         mol_labels = np.array(comp.a)
         n_mols = np.max(mol_labels) + 1
         
-        return [[x for x, y in zip(system, mol_labels==mol_idx) if y] for mol_idx in range(n_mols)]
+        return [[atom for atom, mol_mask in zip(system, mol_labels==mol_idx) if mol_mask] for mol_idx in range(n_mols)]
         
     except ImportError:
-            print("Install graph_tool if you need this to be faster")
+            global graph_tool_message
+            try:
+                graph_tool_message
+            except NameError:
+                print("!!! Install graph_tool if you need this to be faster !!!")
+                print()
+                graph_tool_message = True
             set_atom_ids(system)
             bonds = {}
-            for atom1 in progressbar(system, "Finding molecules "):
-                for atom2 in system:
-                    if atom2.id != atom1.id:
-                        dx = atom1.x - atom2.x
-                        r = pbc.min_image(dx)
-                        bond_r = 0.5 * (atom1.bond_r + atom2.bond_r)
-                        if r < bond_r:
-                            if atom1.id not in bonds.keys():
-                                bonds[atom1.id] = [atom2.id]
-                            else:
-                                if atom2.id not in bonds[atom1.id]:
-                                    bonds[atom1.id].append(atom2.id)
-                            if atom2.id not in bonds.keys():
-                                bonds[atom2.id] = [atom1.id]
-                            else:
-                                if atom1.id not in bonds[atom2.id]:
-                                    bonds[atom2.id].append(atom1.id)
-            
+
+            for i_idx, j_idx in edge_list:
+                if i_idx not in bonds.keys():
+                    bonds[i_idx] = [j_idx]
+                else:
+                    if j_idx not in bonds[i_idx]:
+                        bonds[i_idx].append(j_idx)
+                if j_idx not in bonds.keys():
+                    bonds[j_idx] = [i_idx]
+                else:
+                    if i_idx not in bonds[j_idx]:
+                        bonds[j_idx].append(i_idx)
+
             mols_by_atom_id = []
             
             for atom1 in system:
@@ -1448,7 +1453,7 @@ def print_formula_unit(system: list[Atom]) -> None:
         print(f"{ele} {int(atom_dict[ele] / atoms_gcd)}")
 
 
-def sort(system: list[Atom], pbc: PBC) -> list[Atom]:
+def sort(system: list[Atom], pbc: PBC, output: bool = True) -> list[Atom]:
     atom_sorts = [
         {"name": "element", "key": lambda atom: atom.element, "reverse": False}
     ]
@@ -1467,19 +1472,20 @@ def sort(system: list[Atom], pbc: PBC) -> list[Atom]:
         },
     ]
 
-    print("sorting inside molecules:")
+    if output:
+        print("sorting inside molecules:")
 
-    for sorting_options in reversed(atom_sorts):
-        print(
-            f"    by {sorting_options['name']} - reverse: {sorting_options['reverse']}"
-        )
+        for sorting_options in reversed(atom_sorts):
+            print(
+                f"    by {sorting_options['name']} - reverse: {sorting_options['reverse']}"
+            )
 
-    print("sorting molecules:")
+        print("sorting molecules:")
 
-    for sorting_options in reversed(mol_sorts):
-        print(
-            f"    by {sorting_options['name']} - reverse: {sorting_options['reverse']}"
-        )
+        for sorting_options in reversed(mol_sorts):
+            print(
+                f"    by {sorting_options['name']} - reverse: {sorting_options['reverse']}"
+            )
 
     mols = find_molecules(system, pbc)
 
@@ -2020,7 +2026,7 @@ def menu_movie_write_files(systems: list[list[Atom]], pbcs: list[PBC]) -> None:
             elif option == 2:
                 filename = input("\noutput filename > ")
                 out = open(filename, "w")
-                for system, pbc in zip(systems, pbcs):
+                for system, pbc in progressbar(list(zip(systems, pbcs)), "Writing frame "):
                     write_standard_pdb(system, pbc, out)
                 out.close()
                 print(f"wrote {filename}")
