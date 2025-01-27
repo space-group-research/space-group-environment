@@ -1135,8 +1135,7 @@ def write_standard_pdb(system: list[Atom], pbc: PBC, out: TextIO, skip_mols_step
     if skip_mols_step:
         mols = [system]
     else:
-        system = sort(system, pbc, output=False)
-        mols = find_molecules(system, pbc)
+        system, mols = sort(system, pbc, output=False)
 
     out.write("MODEL        1\n")
     out.write(f"COMPND    {'':<69}\n")
@@ -1320,7 +1319,7 @@ def write_mpmc_pdb(
     write_charges: bool = False,
     write_params: bool = False,
 ) -> None:
-    system = sort(system, pbc)
+    system, mols = sort(system, pbc)
     out = open(filename, "w")
     out.write("MODEL        1\n")
     out.write(f"COMPND    {'':<69}\n")
@@ -1453,7 +1452,7 @@ def print_formula_unit(system: list[Atom]) -> None:
         print(f"{ele} {int(atom_dict[ele] / atoms_gcd)}")
 
 
-def sort(system: list[Atom], pbc: PBC, output: bool = True) -> list[Atom]:
+def sort(system: list[Atom], pbc: PBC, output: bool = True) -> tuple[list[Atom], list[list[Atom]]]:
     atom_sorts = [
         {"name": "element", "key": lambda atom: atom.element, "reverse": False}
     ]
@@ -1501,7 +1500,7 @@ def sort(system: list[Atom], pbc: PBC, output: bool = True) -> list[Atom]:
         for atom in mol:
             system.append(atom)
 
-    return system
+    return system, mols
 
 
 def wrapall_forward(system: list[Atom], pbc: PBC) -> list[Atom]:
@@ -1965,7 +1964,7 @@ def menu_single_extend_wrap(system: list[Atom], pbc: PBC) -> tuple[list[Atom], P
             elif option == 3:
                 wrapall(system, pbc)
             elif option == 4:
-                system = sort(system, pbc)
+                system, mols = sort(system, pbc)
             elif option == 0:
                 return system, pbc
         except ValueError:
