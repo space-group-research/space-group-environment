@@ -420,7 +420,7 @@ class Atom:
         self.id = 0
 
         if element == "H":
-            self.bond_r = 0.8
+            self.bond_r = 0.9
             self.vdw = 1.2
         elif self.atomic_number <= 5: # He - B
             self.bond_r = 1.2
