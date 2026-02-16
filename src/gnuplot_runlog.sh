@@ -464,7 +464,7 @@ then
 			#x axis
 			if [ $x_axis == 1 ] ;
 			then
-				grep -B 3 "Step number" runlog.log | grep "ENERGY| Total FORCE_EVAL" | awk '{printf $9 "\n"}' | sort -u > x_axis.txt
+				grep -B 3 "Step number" runlog.log | grep "ENERGY| Total FORCE_EVAL" | awk '{printf $9 "\n"}' > x_axis.txt
 				x_label="Total Energy [a.u.]"
 
 			elif [ $x_axis == 2 ] ;
@@ -516,7 +516,7 @@ then
 			#y_axis
 			if [ $y_axis == 1 ] ;
 			then
-				grep -B 3 "Step number" runlog.log | grep "ENERGY| Total FORCE_EVAL" | awk '{printf $9 "\n"}' | sort -u > y_axis.txt
+				grep -B 3 "Step number" runlog.log | grep "ENERGY| Total FORCE_EVAL" | awk '{printf $9 "\n"}' > y_axis.txt
 				y_label="Total Energy [a.u.]"
 
 			elif [ $y_axis == 2 ] ;
