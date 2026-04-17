@@ -820,6 +820,14 @@ def get_forcefield(name: int) -> Any:
             "c8": 0.0,
             "c10": 0.0,
         },
+        "Al": {
+            "alpha": 0.417,
+            "sigma": 4.0081,
+            "epsilon": 254.1,
+            "c6": 0.0,
+            "c8": 0.0,
+            "c10": 0.0,
+        },
     }
     ffs.append(opls_aa_uff)
 
