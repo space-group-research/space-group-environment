@@ -56,7 +56,6 @@ import urllib.parse
 import urllib.request
 import asyncio
 import os
-import tempfile
 import argparse
 import subprocess
 
@@ -77,7 +76,46 @@ try:
     from textual.widgets import (     Button,     Checkbox,     DataTable,     DirectoryTree,     Footer,     Input,     Label,     ProgressBar,     RadioButton,     RadioSet,     Select,     TabbedContent,     TextArea, )
     _HAS_TEXTUAL = True
 except ImportError:
-    pass
+    class _TextualStub(type):
+        def __new__(mcls, name, bases, ns, **kw):
+            return super().__new__(mcls, name, bases, ns)
+        def __init__(cls, name, bases, ns, **kw):
+            super().__init__(name, bases, ns)
+        def __getattr__(cls, _n):
+            return _TextualStub(_n, (), {})
+        def __call__(cls, *a, **k):
+            return cls
+        def __getitem__(cls, _i):
+            return cls
+    def _textual_stub(_n):
+        return _TextualStub(_n, (), {})
+    ComposeResult = _textual_stub('ComposeResult')
+    Binding = _textual_stub('Binding')
+    Message = _textual_stub('Message')
+    Widget = _textual_stub('Widget')
+    Checkbox = _textual_stub('Checkbox')
+    DataTable = _textual_stub('DataTable')
+    Label = _textual_stub('Label')
+    RadioButton = _textual_stub('RadioButton')
+    RadioSet = _textual_stub('RadioSet')
+    Select = _textual_stub('Select')
+    Static = _textual_stub('Static')
+    TabbedContent = _textual_stub('TabbedContent')
+    TabPane = _textual_stub('TabPane')
+    Segment = _textual_stub('Segment')
+    Style = _textual_stub('Style')
+    App = _textual_stub('App')
+    Horizontal = _textual_stub('Horizontal')
+    Vertical = _textual_stub('Vertical')
+    Key = _textual_stub('Key')
+    ModalScreen = _textual_stub('ModalScreen')
+    Strip = _textual_stub('Strip')
+    Button = _textual_stub('Button')
+    DirectoryTree = _textual_stub('DirectoryTree')
+    Footer = _textual_stub('Footer')
+    Input = _textual_stub('Input')
+    ProgressBar = _textual_stub('ProgressBar')
+    TextArea = _textual_stub('TextArea')
 
 # ======================================================================
 # Module: constants
@@ -2084,6 +2122,60 @@ def read_file_trajectory(filepath: str) -> list[Molecule] | None:
     for mol in mols:
         mol.detect_bonds()
     return mols
+
+
+# ---------------------------------------------------------------------------
+# Charge files (CP2K RESP and raw columns)
+# ---------------------------------------------------------------------------
+
+def parse_resp_charges(lines: list[str]) -> list[float]:
+    """Extract partial charges from CP2K RESP output lines.
+
+    CP2K writes a couple of header lines, one charge per atom (the charge is the
+    last whitespace-separated token on the line), and a trailing
+    ``Total charge of the system: ...`` line. Header lines are skipped because
+    their last token is not a float; the ``Total`` line is skipped explicitly
+    (its last token *is* a float and would otherwise be read as an atom charge).
+    """
+    charges: list[float] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        words = line.split()
+        if words[0].lower() == "total":
+            continue
+        try:
+            charges.append(float(words[-1]))
+        except ValueError:
+            continue  # header / non-data line
+    return charges
+
+
+def read_charges_file(
+    path: str, skip_first: int = 0, skip_last: int = 0,
+) -> list[float]:
+    """Read partial charges from a file.
+
+    CP2K ``.resp`` files are auto-detected and parsed via
+    :func:`parse_resp_charges` (header/footer/``Total`` lines stripped, last
+    column taken). For any other file the last whitespace-separated token of
+    each non-empty line is taken as the charge, after trimming ``skip_first``
+    leading and ``skip_last`` trailing lines.
+    """
+    with open(path) as f:
+        lines = f.readlines()
+    if path.lower().endswith(".resp"):
+        return parse_resp_charges(lines)
+    end = max(0, len(lines) - skip_last)
+    used = lines[skip_first:end]
+    charges: list[float] = []
+    for raw in used:
+        line = raw.strip()
+        if not line:
+            continue
+        charges.append(float(line.split()[-1]))
+    return charges
 
 # ======================================================================
 # Module: geometry
@@ -8156,6 +8248,18 @@ class ChargesFileModal(ModalScreen[dict | None]):
             self.dismiss({})
 
     def _update_preview(self) -> None:
+        # CP2K .resp files are auto-parsed (headers/footer/Total stripped) — the
+        # skip controls don't apply, so preview the extracted charges directly.
+        if self._file_path.lower().endswith(".resp"):
+            charges = parse_resp_charges(self._raw_lines)
+            preview = [".resp file — auto-parsed, skip controls ignored", ""]
+            preview += [f"{i + 1:>4}: {c:+.6f}" for i, c in enumerate(charges)]
+            self.query_one("#charges-preview", TextArea).text = "\n".join(preview)
+            self.query_one("#line-count", Label).update(
+                f"  {len(charges)} charges (.resp)"
+            )
+            return
+
         try:
             skip_first = self.query_one("#skip-first", SpinBox).value
         except Exception:
@@ -13575,19 +13679,11 @@ class PdbWizardApp(App):
             return  # cancelled
         mol = self.molecule
         try:
-            lines = open(result["path"]).readlines()
-            skip_first = result.get("skip_first", 0)
-            skip_last = result.get("skip_last", 0)
-            end = max(0, len(lines) - skip_last)
-            used = lines[skip_first:end]
-
-            charges: list[float] = []
-            for line in used:
-                line = line.strip()
-                if not line:
-                    continue
-                # Take the last whitespace-separated token as the charge value
-                charges.append(float(line.split()[-1]))
+            charges = read_charges_file(
+                result["path"],
+                skip_first=result.get("skip_first", 0),
+                skip_last=result.get("skip_last", 0),
+            )
 
             n = len(mol.atoms)
             if len(charges) == n:
@@ -13772,21 +13868,7 @@ def _write_mpmc_options(mol: Molecule) -> None:
         while True:
             charges_filename = input("\nEnter a resp file or a valid column of raw charges\ncharges file name > ")
             try:
-                charges: list[float] = []
-                if charges_filename.endswith(".resp"):
-                    with tempfile.NamedTemporaryFile(mode='w+t', delete=False) as tmp:
-                        with open(charges_filename) as f:
-                            next(f)
-                            next(f)
-                            for line in f:
-                                if line.strip():
-                                    words = line.split()
-                                    if words[0] == 'Total':
-                                        continue
-                                    tmp.write(words[-1] + '\n')
-                        charges_filename = tmp.name
-                for line in open(charges_filename).readlines():
-                    charges.append(float(line))
+                charges = read_charges_file(charges_filename)
                 n = len(mol.atoms)
                 if len(charges) == n:
                     for ind, atom in enumerate(mol.atoms):
@@ -14321,8 +14403,20 @@ def main() -> None:
         run_classic(args.file)
     else:
         if not _ensure_installed("textual"):
-            print("Use --classic for the text menu without textual.", file=sys.stderr)
-            sys.exit(1)
+            # textual unavailable (missing and not installed) — fall back to the
+            # classic text menu rather than exiting, so the tool still works.
+            if not args.file:
+                parser.error(
+                    "The interactive TUI needs 'textual'. Install it, or pass a "
+                    "file to use the classic text menu."
+                )
+            print(
+                "'textual' unavailable — falling back to the classic text menu "
+                "(use --classic to select it directly).",
+                file=sys.stderr,
+            )
+            run_classic(args.file)
+            return
 
         if not args.file:
             # No-file launch: empty buffer, user picks via File > Open
