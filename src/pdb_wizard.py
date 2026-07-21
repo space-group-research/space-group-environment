@@ -46,11 +46,14 @@ import re
 import sys
 from pathlib import Path
 from typing import Optional, TextIO
+import struct
+from typing import BinaryIO, Optional
 from functools import reduce
 from math import gcd
 from typing import Any, Iterator, TextIO
 import math
 from typing import Any
+from collections import Counter
 import json
 import urllib.parse
 import urllib.request
@@ -2176,6 +2179,260 @@ def read_charges_file(
             continue
         charges.append(float(line.split()[-1]))
     return charges
+
+# ======================================================================
+# Module: dcd
+# ======================================================================
+"""CHARMM/NAMD/OpenMM DCD trajectory reader.
+
+DCD is a Fortran-style binary format. Each record is bracketed by 4-byte
+int32 length markers. Layout:
+
+    Header record (84 bytes payload):
+        4 bytes "CORD" magic
+        20 × int32 (icntrl):
+            icntrl[0]  = NSET    — number of frames
+            icntrl[1]  = ISTART  — start timestep
+            icntrl[2]  = NSAVC   — steps between frames
+            icntrl[3]  = NSTEP   — total simulation steps
+            icntrl[7]  = NDEGF   — degrees of freedom
+            icntrl[8]  = NFROZEN — frozen atoms
+            icntrl[9]  = DELTA   — time step (float32 stored in int slot)
+            icntrl[10] = USE_BOX — 1 if unit-cell info is written
+            icntrl[19] = VERSION — CHARMM version (24 = unit cell present)
+    Title record (4-byte ntitle + ntitle × 80-byte titles)
+    N_atoms record (1 × int32)
+    Per frame:
+        if USE_BOX: 6 × float64 record (a, gamma, b, beta, alpha, c)
+        x[N] as N × float32
+        y[N] as N × float32
+        z[N] as N × float32
+
+DCD does NOT carry element symbols. Our reader optionally pairs the DCD
+with a topology file (PDB/XYZ/PSF) of the same atom count to assign
+elements. Without a topology, every atom is loaded as carbon and a flag
+is set on the returned molecules so the UI can warn the user.
+"""
+
+
+
+import numpy as np
+
+
+
+def _detect_endian(fh: BinaryIO) -> str:
+    """First 4 bytes are the record-length prefix of the 84-byte header.
+    Read it in both byte orders; whichever yields 84 is the file's endian."""
+    raw = fh.read(4)
+    fh.seek(0)
+    if len(raw) < 4:
+        raise ValueError("DCD file too short")
+    if struct.unpack("<i", raw)[0] == 84:
+        return "<"
+    if struct.unpack(">i", raw)[0] == 84:
+        return ">"
+    raise ValueError(
+        f"DCD header record length is not 84 in either endianness "
+        f"(read {raw!r}). File may be corrupt or not a DCD."
+    )
+
+
+def _read_record(fh: BinaryIO, endian: str) -> bytes:
+    """Read one Fortran record: <int32 length> <payload> <int32 length>.
+    Verifies the suffix length matches the prefix."""
+    head = fh.read(4)
+    if len(head) < 4:
+        raise EOFError("Unexpected EOF reading record header")
+    n = struct.unpack(endian + "i", head)[0]
+    payload = fh.read(n)
+    if len(payload) != n:
+        raise EOFError(f"Short read: expected {n} bytes, got {len(payload)}")
+    tail = fh.read(4)
+    if len(tail) < 4:
+        raise EOFError("Unexpected EOF reading record trailer")
+    nt = struct.unpack(endian + "i", tail)[0]
+    if nt != n:
+        raise ValueError(
+            f"DCD record bracket mismatch: head={n}, tail={nt} "
+            f"(file likely corrupt or written in a different endianness)"
+        )
+    return payload
+
+
+def _parse_header(payload: bytes, endian: str) -> dict:
+    """Header payload: 4-char magic + 20 int32."""
+    if len(payload) != 84:
+        raise ValueError(f"Header payload should be 84 bytes, got {len(payload)}")
+    magic = payload[:4]
+    if magic != b"CORD":
+        raise ValueError(f"Expected CORD magic, got {magic!r}")
+    icntrl = struct.unpack(endian + "20i", payload[4:84])
+    return {
+        "n_frames": icntrl[0],
+        "i_start": icntrl[1],
+        "n_savc": icntrl[2],
+        "n_step": icntrl[3],
+        "n_degf": icntrl[7],
+        "n_frozen": icntrl[8],
+        "delta_raw": icntrl[9],  # float32 packed into int32 slot in CHARMM ≥24
+        "has_box": bool(icntrl[10]),
+        "version": icntrl[19],
+    }
+
+
+def _read_topology_elements(topo_path: str, n_expected: int) -> list[str] | None:
+    """Read element symbols from a sibling PDB/XYZ topology file.
+    Returns None if it doesn't fit (different atom count) or can't be parsed."""
+    suffix = Path(topo_path).suffix.lower()
+    try:
+        if suffix in (".pdb", ".ent", ".pqr"):
+            with open(topo_path) as f:
+                atoms, _ = read_pdb(f)
+        elif suffix == ".xyz":
+            with open(topo_path) as f:
+                atoms, _ = read_xyz(f)
+        else:
+            return None
+        if len(atoms) != n_expected:
+            return None
+        return [a.element.symbol for a in atoms]
+    except Exception:
+        return None
+
+
+def _find_sibling_topology(dcd_path: str) -> str | None:
+    """Locate a topology file next to the DCD.
+
+    Lookup order:
+      1. Same stem with PDB/PQR/ENT/XYZ extension (e.g. traj.pdb next to traj.dcd)
+      2. Any .pdb / .pqr / .xyz in the same directory — common when the
+         topology was written by openmm (e.g. system.pdb or final.pdb
+         next to trajectory.dcd).
+    """
+    p = Path(dcd_path)
+    # 1. Same-stem match
+    for ext in (".pdb", ".pqr", ".ent", ".xyz"):
+        candidate = p.with_suffix(ext)
+        if candidate.exists():
+            return str(candidate)
+    # 2. Any topology in the same directory
+    for ext in (".pdb", ".pqr", ".xyz"):
+        siblings = sorted(p.parent.glob(f"*{ext}"))
+        if siblings:
+            return str(siblings[0])
+    return None
+
+
+def read_dcd_trajectory(
+    filepath: str,
+    topology_file: str | None = None,
+    progress_callback=None,
+) -> tuple[list[Molecule], list[Optional[PBC]]]:
+    """Read a DCD file. Returns (frames, pbcs) — same shape as
+    read_pdb_trajectory and read_xyz_trajectory.
+
+    If `topology_file` is None, searches for a sibling PDB/XYZ next to the
+    DCD. Without any topology, every atom is loaded as carbon and the
+    returned Molecules carry `mol._dcd_topology_missing = True` so the UI
+    can warn the user.
+    """
+    # Resolve element list from topology
+    topology_path = topology_file or _find_sibling_topology(filepath)
+
+    with open(filepath, "rb") as fh:
+        endian = _detect_endian(fh)
+        header_payload = _read_record(fh, endian)
+        hdr = _parse_header(header_payload, endian)
+
+        # Title record (skip — purely informational)
+        _read_record(fh, endian)
+
+        # N_atoms record (one int32)
+        n_atoms_payload = _read_record(fh, endian)
+        if len(n_atoms_payload) != 4:
+            raise ValueError(
+                f"N_atoms record should be 4 bytes, got {len(n_atoms_payload)}"
+            )
+        n_atoms = struct.unpack(endian + "i", n_atoms_payload)[0]
+        if n_atoms <= 0:
+            raise ValueError(f"DCD reports {n_atoms} atoms — invalid")
+
+        # Try to fetch element symbols from topology
+        elements: list[str]
+        topology_missing = False
+        if topology_path:
+            els = _read_topology_elements(topology_path, n_atoms)
+            if els is not None:
+                elements = els
+            else:
+                elements = ["C"] * n_atoms
+                topology_missing = True
+        else:
+            elements = ["C"] * n_atoms
+            topology_missing = True
+
+        # Frames
+        frames: list[Molecule] = []
+        pbcs: list[Optional[PBC]] = []
+        coords_size = n_atoms * 4
+        for fi in range(hdr["n_frames"]):
+            pbc: Optional[PBC] = None
+            if hdr["has_box"]:
+                box_payload = _read_record(fh, endian)
+                if len(box_payload) != 48:
+                    raise ValueError(
+                        f"Frame {fi}: box record should be 48 bytes, "
+                        f"got {len(box_payload)}"
+                    )
+                # CHARMM/NAMD order: a, gamma, b, beta, alpha, c
+                a, gamma, b, beta, alpha, c = struct.unpack(endian + "6d", box_payload)
+                # Some versions store cosines instead of angles (-1..1)
+                if -1.0 <= alpha <= 1.0 and -1.0 <= beta <= 1.0 and -1.0 <= gamma <= 1.0:
+                    alpha = float(np.degrees(np.arccos(alpha)))
+                    beta = float(np.degrees(np.arccos(beta)))
+                    gamma = float(np.degrees(np.arccos(gamma)))
+                if a > 0 and b > 0 and c > 0:
+                    pbc = PBC(a, b, c, alpha, beta, gamma)
+
+            x_payload = _read_record(fh, endian)
+            if len(x_payload) != coords_size:
+                raise ValueError(
+                    f"Frame {fi}: x-record should be {coords_size} bytes, "
+                    f"got {len(x_payload)}"
+                )
+            xs = np.frombuffer(x_payload, dtype=endian + "f4")
+            ys = np.frombuffer(_read_record(fh, endian), dtype=endian + "f4")
+            zs = np.frombuffer(_read_record(fh, endian), dtype=endian + "f4")
+
+            atoms = [
+                Atom(float(xs[i]), float(ys[i]), float(zs[i]), elements[i])
+                for i in range(n_atoms)
+            ]
+            set_atom_ids(atoms)
+            mol = Molecule(atoms=atoms, pbc=pbc)
+            if topology_missing:
+                # Tag the molecule so UI/CLI can surface a warning to users
+                mol._dcd_topology_missing = True
+            frames.append(mol)
+            pbcs.append(pbc)
+
+            if progress_callback and hdr["n_frames"] > 0:
+                progress_callback((fi + 1) / hdr["n_frames"])
+
+    return frames, pbcs
+
+
+def check_dcd_trajectory(filepath: str) -> bool:
+    """Return True if the file is a parseable DCD with at least one frame.
+    Does not load full data — just probes the header."""
+    try:
+        with open(filepath, "rb") as fh:
+            endian = _detect_endian(fh)
+            header_payload = _read_record(fh, endian)
+            hdr = _parse_header(header_payload, endian)
+            return hdr["n_frames"] >= 1
+    except Exception:
+        return False
 
 # ======================================================================
 # Module: geometry
@@ -4681,6 +4938,257 @@ _BUNDLED_TEMPLATES.update({
 })
 
 # ======================================================================
+# Module: sim_inputs
+# ======================================================================
+"""Generate input scripts for external simulation packages.
+
+Currently supported:
+  * OpenMM (Python script): NPT or NVT MD with TIP3P / amber14 by default
+  * CP2K (input file): cell optimization and DFT-MD
+
+All input files are rendered from templates under `src/pdb_wizard/templates/`
+using the placeholder syntax `{{{name}}}`. This module is responsible only
+for (1) writing the companion coordinate file, (2) computing derived
+template variables from the loaded Molecule, and (3) invoking the
+template renderer.
+"""
+
+
+
+try:  # Literal moved into typing in 3.8; typing_extensions backports it for 3.7
+    from typing import Literal
+except ImportError:  # pragma: no cover - exercised only on Python 3.7
+    from typing_extensions import Literal
+
+
+# ---------------------------------------------------------------------------
+# OpenMM
+# ---------------------------------------------------------------------------
+
+OpenMMEnsemble = Literal["NPT", "NVT"]
+
+
+def _ff_python_literal(forcefield: str) -> str:
+    """Convert 'amber14-all.xml,amber14/tip3pfb.xml' into a Python argument
+    list: `'amber14-all.xml', 'amber14/tip3pfb.xml'` — suitable for splicing
+    into `ForceField({...})` in the template."""
+    return ", ".join(repr(x.strip()) for x in forcefield.split(",") if x.strip())
+
+
+def _nvt_nonbonded_setup(has_pbc: bool, cutoff_nm: float) -> str:
+    """Build the createSystem() nonbonded kwargs block for NVT.
+
+    With PBC we use PME and pass a cutoff. Without PBC, OpenMM's NoCutoff
+    method doesn't accept `nonbondedCutoff`, so we emit just the method.
+    """
+    if has_pbc:
+        return (
+            f"    nonbondedMethod=PME,\n"
+            f"    nonbondedCutoff={cutoff_nm} * nanometer,\n"
+        )
+    return "    nonbondedMethod=NoCutoff,\n"
+
+
+def generate_openmm_script(
+    mol: Molecule,
+    output_dir: str | Path,
+    ensemble: OpenMMEnsemble = "NPT",
+    *,
+    forcefield: str = "amber14-all.xml,amber14/tip3pfb.xml",
+    temperature_K: float = 300.0,
+    pressure_atm: float = 1.0,
+    timestep_fs: float = 2.0,
+    n_steps: int = 100_000,
+    report_interval: int = 1000,
+    nonbonded_cutoff_nm: float = 1.0,
+    pdb_filename: str = "system.pdb",
+    script_filename: str = "run.py",
+) -> dict:
+    """Write an OpenMM Python driver + a PDB topology file.
+
+    Returns a dict with the paths written.
+    """
+    if ensemble not in ("NPT", "NVT"):
+        raise ValueError(f"ensemble must be NPT or NVT, got {ensemble!r}")
+    if mol.pbc is None and ensemble == "NPT":
+        raise ValueError("NPT simulation requires a periodic box (mol.pbc).")
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # PDB topology — skip_mols_step=False so atoms group into named residues
+    # (HOH, MET, etc.), which amber-style force fields need to find templates.
+    pdb_path = out / pdb_filename
+    write_standard_pdb(mol, str(pdb_path), skip_mols_step=False)
+
+    common_vars = {
+        "pdb_filename": pdb_filename,
+        "script_filename": script_filename,
+        "forcefield_xmls": _ff_python_literal(forcefield),
+        "temperature_k": temperature_K,
+        "timestep_fs": timestep_fs,
+        "n_steps": n_steps,
+        "report_interval": report_interval,
+        "nonbonded_cutoff_nm": nonbonded_cutoff_nm,
+    }
+
+    if ensemble == "NPT":
+        template = load_template("openmm_npt.py")
+        rendered = render(template, {
+            **common_vars,
+            "pressure_atm": pressure_atm,
+        })
+    else:  # NVT
+        template = load_template("openmm_nvt.py")
+        rendered = render(template, {
+            **common_vars,
+            "nonbonded_setup": _nvt_nonbonded_setup(
+                mol.pbc is not None, nonbonded_cutoff_nm,
+            ),
+        })
+
+    script_path = out / script_filename
+    script_path.write_text(rendered)
+
+    return {
+        "script": str(script_path),
+        "pdb": str(pdb_path),
+        "ensemble": ensemble,
+        "n_steps": n_steps,
+        "temperature_K": temperature_K,
+        "pressure_atm": pressure_atm if ensemble == "NPT" else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CP2K
+# ---------------------------------------------------------------------------
+
+CP2KMode = Literal["cell_opt", "dft_md"]
+
+
+def _formula_summary(mol: Molecule) -> str:
+    counts = Counter(a.element.symbol for a in mol.atoms)
+    return "".join(f"{el}{n}" if n > 1 else el for el, n in sorted(counts.items()))
+
+
+def _kind_section(symbol: str, basis: str = "DZVP-MOLOPT-SR-GTH",
+                  potential: str = "GTH-PBE") -> str:
+    """Build a CP2K &KIND block for one element. Tries to choose a sensible
+    Q-value (number of valence electrons) for the GTH pseudopotential; falls
+    back to '-q' suffix omitted (CP2K will pick the default)."""
+    Q = {
+        "H": 1, "He": 2, "Li": 3, "Be": 4, "B": 3, "C": 4, "N": 5, "O": 6, "F": 7,
+        "Ne": 8, "Na": 9, "Mg": 10, "Al": 3, "Si": 4, "P": 5, "S": 6, "Cl": 7,
+        "Ar": 8, "K": 9, "Ca": 10, "Ti": 12, "V": 13, "Cr": 14, "Mn": 15,
+        "Fe": 16, "Co": 17, "Ni": 18, "Cu": 11, "Zn": 12, "Ga": 13, "Br": 7,
+        "I": 7, "Pt": 18, "Au": 11,
+    }
+    pot = potential
+    if symbol in Q:
+        pot = f"{potential}-q{Q[symbol]}"
+    return (
+        f"    &KIND {symbol}\n"
+        f"      BASIS_SET {basis}\n"
+        f"      POTENTIAL {pot}\n"
+        f"    &END KIND\n"
+    )
+
+
+def _build_kind_blocks(mol: Molecule) -> str:
+    elements_present = sorted({a.element.symbol for a in mol.atoms})
+    return "".join(_kind_section(el) for el in elements_present)
+
+
+def _write_xyz(mol: Molecule, path: Path) -> None:
+    lines = [str(len(mol.atoms)), f"{_formula_summary(mol)} from pdb_wizard"]
+    for a in mol.atoms:
+        lines.append(
+            f"{a.element.symbol}  {a.x[0]:.6f}  {a.x[1]:.6f}  {a.x[2]:.6f}"
+        )
+    path.write_text("\n".join(lines) + "\n")
+
+
+def generate_cp2k_input(
+    mol: Molecule,
+    output_dir: str | Path,
+    mode: CP2KMode = "cell_opt",
+    *,
+    project_name: str = "pdbwizard",
+    cutoff_Ry: float = 400.0,
+    rel_cutoff_Ry: float = 60.0,
+    xc_functional: str = "PBE",
+    eps_scf: float = 1.0e-7,
+    max_scf: int = 50,
+    temperature_K: float = 300.0,
+    timestep_fs: float = 0.5,
+    n_md_steps: int = 10_000,
+    n_opt_steps: int = 200,
+    md_traj_interval: int = 10,
+    coords_filename: str = "system.xyz",
+    input_filename: str = "input.inp",
+) -> dict:
+    """Write a CP2K input file (`.inp`) plus an XYZ coordinate file.
+
+    `mode='cell_opt'` runs CP2K's CELL_OPT to relax both atomic positions
+    and the unit cell. `mode='dft_md'` runs Born-Oppenheimer MD in NVT.
+    """
+    if mode not in ("cell_opt", "dft_md"):
+        raise ValueError(f"mode must be cell_opt or dft_md, got {mode!r}")
+    if mol.pbc is None:
+        raise ValueError("CP2K requires a periodic cell (mol.pbc).")
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    xyz_path = out / coords_filename
+    _write_xyz(mol, xyz_path)
+
+    pbc = mol.pbc
+    common_vars = {
+        "project": project_name,
+        "cell_a": f"{pbc.a:.6f}",
+        "cell_b": f"{pbc.b:.6f}",
+        "cell_c": f"{pbc.c:.6f}",
+        "cell_alpha": f"{pbc.alpha:.4f}",
+        "cell_beta": f"{pbc.beta:.4f}",
+        "cell_gamma": f"{pbc.gamma:.4f}",
+        "coords_file": coords_filename,
+        "kind_blocks": _build_kind_blocks(mol),
+        "cutoff_ry": cutoff_Ry,
+        "rel_cutoff_ry": rel_cutoff_Ry,
+        "xc_functional": xc_functional,
+        "eps_scf": eps_scf,
+        "max_scf": max_scf,
+    }
+
+    if mode == "cell_opt":
+        template = load_template("cp2k_cell_opt.inp")
+        rendered = render(template, {
+            **common_vars,
+            "n_opt_steps": n_opt_steps,
+        })
+    else:  # dft_md
+        template = load_template("cp2k_dft_md.inp")
+        rendered = render(template, {
+            **common_vars,
+            "temperature": temperature_K,
+            "timestep_fs": timestep_fs,
+            "n_md_steps": n_md_steps,
+            "md_traj_interval": md_traj_interval,
+        })
+
+    inp_path = out / input_filename
+    inp_path.write_text(rendered)
+
+    return {
+        "input": str(inp_path),
+        "xyz": str(xyz_path),
+        "mode": mode,
+        "project": project_name,
+        "elements": sorted({a.element.symbol for a in mol.atoms}),
+    }
+
+# ======================================================================
 # Module: isotherm
 # ======================================================================
 """Isotherm planner — generates MPMC input directories at multiple pressures.
@@ -6709,7 +7217,7 @@ OPERATIONS = [
     ("substitute",     "Substitute Element",       "modify"),
     ("reduce_cell",    "Reduce Supercell",         "modify"),
     ("qeq_charges",    "Generate QEq Charges",     "modify"),
-    # ---- File (mirrors top bar File menu, sans 'Quit') ----
+    # ---- File (mirrors top bar File menu) ----
     ("open_file",      "Open File...",             "export"),
     ("write_xyz",      "Save as XYZ",              "export"),
     ("write_pdb",      "Save as PDB",              "export"),
@@ -6720,6 +7228,7 @@ OPERATIONS = [
     ("frame_to_tab",   "Open Frame in New Tab",    "export"),
     ("export_png",     "Export PNG",               "export"),
     ("export_gif",     "Export Rotation GIF",      "export"),
+    ("quit",           "Quit",                     "export"),
 ]
 
 
@@ -7383,6 +7892,20 @@ class VisualPanel(Widget):
 
 
 
+if not hasattr(asyncio, "to_thread"):
+    # Python 3.8 backport of asyncio.to_thread (added in 3.9). pdb_wizard
+    # targets >=3.8 and offloads analysis compute via to_thread throughout.
+    import contextvars
+    import functools
+
+    async def _to_thread(func, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        ctx = contextvars.copy_context()
+        call = functools.partial(ctx.run, func, *args, **kwargs)
+        return await loop.run_in_executor(None, call)
+
+    asyncio.to_thread = _to_thread
+
 import numpy as np
 
 
@@ -7397,7 +7920,7 @@ _BRAILLE_MAP = np.array(
 )
 
 
-class InputModal(ModalScreen[str | None]):
+class InputModal(ModalScreen[Optional[str]]):
     """Modal dialog that prompts for a text value with OK/Cancel."""
 
     # No 'q' binding — the focused Input would capture it as text. Escape only.
@@ -7598,7 +8121,7 @@ class ConfirmModal(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class FileSaveModal(ModalScreen[str | None]):
+class FileSaveModal(ModalScreen[Optional[str]]):
     """Modal file browser for choosing a save location."""
 
     # No 'q' binding — the focused Input/DirectoryTree would capture it. Escape only.
@@ -7673,7 +8196,7 @@ class FileSaveModal(ModalScreen[str | None]):
         self.dismiss("")
 
 
-class ForceFieldModal(ModalScreen[str | None]):
+class ForceFieldModal(ModalScreen[Optional[str]]):
     """Modal to select a force field with a live parameter preview."""
 
     BINDINGS = [
@@ -7795,12 +8318,12 @@ class ForceFieldModal(ModalScreen[str | None]):
             elif self.query_one("#ff-oplsaa", RadioButton).value:
                 self.dismiss("OPLSAA")
             else:
-                self.dismiss("")  # None selected
+                self.dismiss("")  # None selected: skip FF but continue the flow
         else:
-            self.dismiss("")
+            self.dismiss(None)  # Cancel: abort the whole flow
 
     def action_cancel(self) -> None:
-        self.dismiss("")
+        self.dismiss(None)  # Cancel: abort the whole flow
 
 
 class TrackSlider(Widget):
@@ -8046,7 +8569,7 @@ class ExtendAxisModal(ModalScreen[tuple]):
         self.dismiss(())
 
 
-class SorbateModal(ModalScreen[str | None]):
+class SorbateModal(ModalScreen[Optional[str]]):
     """Modal to select a sorbate molecule to insert into the MPMC PDB."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("q", "cancel", "Close")]
@@ -8123,19 +8646,19 @@ class SorbateModal(ModalScreen[str | None]):
                     return
             self.dismiss("")
         elif event.button.id == "sorb-skip":
-            self.dismiss("")
+            self.dismiss("")  # Skip: no sorbate, but continue the flow
         else:
-            self.dismiss("")
+            self.dismiss(None)  # Cancel: abort the whole flow
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.row_key.value and not event.row_key.value.startswith("_hdr_"):
             self.dismiss(event.row_key.value)
 
     def action_cancel(self) -> None:
-        self.dismiss("")
+        self.dismiss(None)  # Cancel: abort the whole flow
 
 
-class ChargesFileModal(ModalScreen[dict | None]):
+class ChargesFileModal(ModalScreen[Optional[dict]]):
     """File browser with preview and line-skip controls for loading charges."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("q", "cancel", "Close")]
@@ -9235,7 +9758,7 @@ class GyrationScreen(_AnalysisScreen):
         self._do_export_csv(filepath, "frame,rg_A", self._last_idx, self._last_rg)
 
 
-class ReduceCellScreen(ModalScreen[Molecule | None]):
+class ReduceCellScreen(ModalScreen[Optional[Molecule]]):
     """Reduce a supercell to a primitive cell, selecting which sorbates to keep."""
     BINDINGS = [Binding("escape", "close", "Close"), Binding("q", "close", "Close")]
     DEFAULT_CSS = """
@@ -11045,7 +11568,7 @@ class MenuBar(Widget):
             pass
 
 
-class MenuDropdown(ModalScreen[str | None]):
+class MenuDropdown(ModalScreen[Optional[str]]):
     """Dropdown menu that appears under a menu button."""
 
     BINDINGS = [
@@ -13117,6 +13640,12 @@ class PdbWizardApp(App):
                 self._mpmc_step_charge_source()
             return
 
+        elif cmd == "quit":
+            # Direct exit: selecting Quit from the menu is already deliberate,
+            # so it doesn't use the bare-'q' "press again" confirmation.
+            self.exit()
+            return
+
         view._invalidate_cache()
 
     async def _refresh_molecule(self, msg: str = "") -> None:
@@ -13714,7 +14243,9 @@ class PdbWizardApp(App):
             callback=self._mpmc_step_ff_apply,
         )
 
-    def _mpmc_step_ff_apply(self, ff_name: str) -> None:
+    def _mpmc_step_ff_apply(self, ff_name: str | None) -> None:
+        if ff_name is None:
+            return  # Cancel: abort the MPMC export
         if not ff_name:
             self._mpmc_state["write_ff"] = False
         else:
@@ -13731,7 +14262,9 @@ class PdbWizardApp(App):
             callback=self._mpmc_step_sorbate_result,
         )
 
-    def _mpmc_step_sorbate_result(self, model_name: str) -> None:
+    def _mpmc_step_sorbate_result(self, model_name: str | None) -> None:
+        if model_name is None:
+            return  # Cancel: abort the MPMC export
         self._mpmc_state["sorbate"] = model_name if model_name else None
         self._mpmc_step_filename()
 
@@ -13787,21 +14320,13 @@ def _list_coords(mol: Molecule) -> None:
         print(f"{atom.element.symbol} {atom.x}")
 
 
-def _list_molecules(mol: Molecule) -> None:
-    submols = mol.find_molecules()
-    for submol in submols:
-        submol.atoms.sort(key=lambda a: a.atomic_number, reverse=True)
-        elements = [a.element.symbol for a in submol.atoms]
-        print("".join(elements))
-
-
 def _vmd_preview(mol: Molecule) -> None:
     write_mpmc_pdb(mol, "pdb_wizard.tmp.pdb")
     os.system("vmd pdb_wizard.tmp.pdb")
     os.system("rm pdb_wizard.tmp.pdb")
 
 
-def _menu_update_pbc(pbc: PBC) -> PBC:
+def _prompt_cell() -> tuple[float, float, float, float, float, float]:
     while True:
         try:
             a = float(input("Enter cell information\na>     "))
@@ -13810,18 +14335,19 @@ def _menu_update_pbc(pbc: PBC) -> PBC:
             alpha = float(input("alpha> "))
             beta = float(input("beta>  "))
             gamma = float(input("gamma> "))
-            break
+            return a, b, c, alpha, beta, gamma
         except ValueError:
             print("!!! Error converting input to float !!!\n")
-    pbc.update(a, b, c, alpha, beta, gamma)
+
+
+def _menu_update_pbc(pbc: PBC) -> PBC:
+    pbc.update(*_prompt_cell())
     return pbc
 
 
-def _menu_extend_axis(mol: Molecule) -> Molecule:
-    if mol.pbc is None:
-        print("No PBC data available")
-        return mol
-    pbc = mol.pbc
+def _prompt_axis_times(pbc: PBC) -> tuple[int, int] | None:
+    """Prompt for an axis (0/1/2 or x/y/z) and a replication count, showing the
+    current cell. Returns (axis, times), or None if the user cancels."""
     print(
         f"\nCurrent cell:\n{round(pbc.a, 3):>7}  {round(pbc.b, 3):7}  {round(pbc.c, 3):7} "
         f"{round(pbc.alpha, 2):>6} {round(pbc.beta, 2):>6} {round(pbc.gamma, 2):>6}\n"
@@ -13834,17 +14360,48 @@ def _menu_extend_axis(mol: Molecule) -> Molecule:
                 "\nWhat axis would you like to extend? 0, 1, 2 or x, y, z or q(uit)\n\n> "
             )
             if axis_in.lower() in ("q", "quit"):
-                return mol
+                return None
             axis_map = {"x": 0, "y": 1, "z": 2}
-            axis = axis_map.get(axis_in.lower(), int(axis_in))
+            # Don't use dict.get(..., int(axis_in)): the default is evaluated
+            # eagerly, so a letter axis would raise before the lookup.
+            if axis_in.lower() in axis_map:
+                axis = axis_map[axis_in.lower()]
+            else:
+                axis = int(axis_in)
             if axis < 0 or axis > 2:
                 raise ValueError
             times = int(input("\nHow many times would you like to extend it?\n\n> "))
             if times < 1:
                 raise ValueError
-            break
+            return axis, times
         except ValueError:
             print("!!! Error converting input to int or x, y, z !!!")
+
+
+def _prompt_frame(n_frames: int) -> int | None:
+    """Prompt for a 1-based frame number, returning the 0-based index (or None
+    if the user cancels)."""
+    while True:
+        try:
+            raw = input(f"\nWhich frame? (1-{n_frames}, q to cancel)\n\n> ")
+            if raw.lower() in ("q", "quit"):
+                return None
+            idx = int(raw) - 1
+            if idx < 0 or idx >= n_frames:
+                raise ValueError
+            return idx
+        except ValueError:
+            print(f"!!! Error: enter a frame number from 1 to {n_frames} !!!")
+
+
+def _menu_extend_axis(mol: Molecule) -> Molecule:
+    if mol.pbc is None:
+        print("No PBC data available")
+        return mol
+    res = _prompt_axis_times(mol.pbc)
+    if res is None:
+        return mol
+    axis, times = res
     return extend_axis(mol, axis, times)
 
 
@@ -13866,7 +14423,10 @@ def _write_mpmc_options(mol: Molecule) -> None:
 
     if write_charges:
         while True:
-            charges_filename = input("\nEnter a resp file or a valid column of raw charges\ncharges file name > ")
+            charges_filename = input(
+                "\nEnter a resp file or a valid column of raw charges\n"
+                "charges file name > "
+            )
             try:
                 charges = read_charges_file(charges_filename)
                 n = len(mol.atoms)
@@ -13926,11 +14486,10 @@ def _menu_geom_analysis(mol: Molecule) -> Molecule:
                 "3 = list angles\n"
                 "4 = list lone atoms\n"
                 "5 = delete lone atoms\n"
-                "6 = list molecules\n"
-                "7 = list coordinates\n"
-                "8 = edit hydrogen bond distances\n"
-                "9 = preview with VMD\n"
-                "0 = back to main menu\n\n> "
+                "6 = list coordinates\n"
+                "7 = edit hydrogen bond distances\n"
+                "8 = preview with VMD\n"
+                "9 = back to main menu\n\n> "
             ))
         except ValueError:
             print("!!! Error converting input to int !!!")
@@ -13957,73 +14516,15 @@ def _menu_geom_analysis(mol: Molecule) -> Molecule:
         elif option == 5:
             mol = delete_lone_atoms(mol)
         elif option == 6:
-            _list_molecules(mol)
-        elif option == 7:
             _list_coords(mol)
-        elif option == 8:
+        elif option == 7:
             el = input("\nLook for hydrogens bonded with which element?\n\n> ")
             dist = float(input(f"\nWhat distance shall {el}-H bonds be set to?\n\n> "))
             mol = edit_h_dist(mol, el, dist)
-        elif option == 9:
+        elif option == 8:
             _vmd_preview(mol)
-        elif option == 0:
+        elif option == 9:
             return mol
-    return mol
-
-
-def _menu_write_files(mol: Molecule) -> None:
-    while True:
-        try:
-            option = int(input(
-                "\nWhat would you like to do?\n\n"
-                "1 = write xyz file\n"
-                "2 = write MPMC PDB file\n"
-                "3 = write standard PDB file\n"
-                "0 = back to main menu\n\n> "
-            ))
-            if option == 1:
-                filename = input("\noutput filename > ")
-                with open(filename, "w") as out:
-                    write_xyz(mol, out)
-                print(f"wrote {filename}")
-            elif option == 2:
-                _write_mpmc_options(mol)
-            elif option == 3:
-                filename = input("\noutput filename > ")
-                with open(filename, "w") as out:
-                    write_standard_pdb(mol, out)
-                print(f"wrote {filename}")
-            elif option == 0:
-                return
-        except ValueError:
-            print("!!! Error converting input to int !!!")
-
-
-def _menu_extend_wrap(mol: Molecule) -> Molecule:
-    while True:
-        try:
-            option = int(input(
-                "\nWhat would you like to do?\n\n"
-                "1 = extend along axis\n"
-                "2 = wrap atoms from (0, 0, 0) to (1, 1, 1)\n"
-                "3 = wrap atoms from (-1/2, -1/2, -1/2) to (1/2, 1/2, 1/2)\n"
-                "4 = sort atoms\n"
-                "0 = back to main menu\n\n> "
-            ))
-            if option == 1:
-                mol = _menu_extend_axis(mol)
-            elif option == 2:
-                wrap_atoms(mol, forward=True)
-                print("\nWrapped atoms forward of origin")
-            elif option == 3:
-                wrap_atoms(mol)
-                print("\nWrapped atoms around origin")
-            elif option == 4:
-                sort_system(mol)
-            elif option == 0:
-                return mol
-        except ValueError:
-            print("!!! Error converting input to int !!!")
     return mol
 
 
@@ -14036,10 +14537,14 @@ def _main_loop_single(mol: Molecule, filename: str) -> None:
             option = int(input(
                 "\nWhat would you like to do?\n\n"
                 "1 = geometry analysis\n"
-                "2 = extend axis, wrap, or sort\n"
-                "3 = write files\n"
-                "4 = update unit cell\n"
-                "0 = quit\n\n> "
+                "2 = extend along axis\n"
+                "3 = wrap atoms from (0, 0, 0) to (1, 1, 1)\n"
+                "4 = wrap atoms from (-1/2, -1/2, -1/2) to (1/2, 1/2, 1/2)\n"
+                "5 = update cell dimensions\n"
+                "6 = write .xyz\n"
+                "7 = write MPMC .pdb\n"
+                "8 = write standardized .pdb\n"
+                "9 = quit\n\n> "
             ))
         except ValueError:
             print("!!! Error converting input to int !!!")
@@ -14047,51 +14552,104 @@ def _main_loop_single(mol: Molecule, filename: str) -> None:
         if option == 1:
             mol = _menu_geom_analysis(mol)
         elif option == 2:
-            mol = _menu_extend_wrap(mol)
+            mol = _menu_extend_axis(mol)
         elif option == 3:
-            _menu_write_files(mol)
+            wrap_atoms(mol, forward=True)
+            print("\nWrapped atoms forward of origin")
         elif option == 4:
+            wrap_atoms(mol)
+            print("\nWrapped atoms around origin")
+        elif option == 5:
             if mol.pbc is not None:
                 mol.pbc = _menu_update_pbc(mol.pbc)
-        elif option == 0:
+        elif option == 6:
+            out_filename = input("\noutput filename > ")
+            with open(out_filename, "w") as out:
+                write_xyz(mol, out)
+            print(f"wrote {out_filename}")
+        elif option == 7:
+            _write_mpmc_options(mol)
+        elif option == 8:
+            out_filename = input("\noutput filename > ")
+            with open(out_filename, "w") as out:
+                write_standard_pdb(mol, out)
+            print(f"wrote {out_filename}")
+        elif option == 9:
             break
+        else:
+            print("\nInvalid option!")
 
 
 def _main_loop_movie(molecules: list[Molecule], filename: str) -> None:
     while True:
         print_info_movie(len(molecules), filename)
+        n = len(molecules)
         try:
             option = int(input(
                 "\nWhat would you like to do?\n\n"
-                "1 = extend, wrap, sort\n"
-                "2 = write files\n"
-                "0 = quit\n\n> "
+                "1 = geometry analysis (single frame)\n"
+                "2 = extend along axis (all frames)\n"
+                "3 = wrap atoms from (0, 0, 0) to (1, 1, 1) (all frames)\n"
+                "4 = wrap atoms from (-1/2, -1/2, -1/2) to (1/2, 1/2, 1/2) (all frames)\n"
+                "5 = update cell dimensions (all frames)\n"
+                "6 = write .xyz (all frames)\n"
+                "7 = write MPMC .pdb (single frame)\n"
+                "8 = write standardized .pdb (all frames)\n"
+                "9 = quit\n\n> "
             ))
         except ValueError:
             print("!!! Error converting input to int !!!")
             continue
         if option == 1:
-            # Apply operations to all frames
-            for mol in molecules:
-                pass  # submenu would go here
+            idx = _prompt_frame(n)
+            if idx is not None:
+                molecules[idx] = _menu_geom_analysis(molecules[idx])
         elif option == 2:
-            try:
-                woption = int(input(
-                    "\n1 = write xyz\n2 = write standard PDB\n0 = back\n\n> "
-                ))
-                if woption in (1, 2):
-                    fname = input("\noutput filename > ")
-                    with open(fname, "w") as out:
-                        for mol in molecules:
-                            if woption == 1:
-                                write_xyz(mol, out)
-                            else:
-                                write_standard_pdb(mol, out)
-                    print(f"wrote {fname}")
-            except ValueError:
-                print("!!! Error !!!")
-        elif option == 0:
+            if molecules[0].pbc is None:
+                print("No PBC data available")
+            else:
+                res = _prompt_axis_times(molecules[0].pbc)
+                if res is not None:
+                    axis, times = res
+                    molecules = [extend_axis(m, axis, times) for m in molecules]
+                    print(f"\nExtended all {len(molecules)} frames")
+        elif option == 3:
+            for m in molecules:
+                wrap_atoms(m, forward=True)
+            print(f"\nWrapped atoms forward of origin in all {n} frames")
+        elif option == 4:
+            for m in molecules:
+                wrap_atoms(m)
+            print(f"\nWrapped atoms around origin in all {n} frames")
+        elif option == 5:
+            if molecules[0].pbc is None:
+                print("No PBC data available")
+            else:
+                vals = _prompt_cell()
+                for m in molecules:
+                    if m.pbc is not None:
+                        m.pbc.update(*vals)
+                print(f"\nUpdated cell dimensions in all {n} frames")
+        elif option == 6:
+            out_filename = input("\noutput filename > ")
+            with open(out_filename, "w") as out:
+                for m in molecules:
+                    write_xyz(m, out)
+            print(f"wrote {n} frames to {out_filename}")
+        elif option == 7:
+            idx = _prompt_frame(n)
+            if idx is not None:
+                _write_mpmc_options(molecules[idx])
+        elif option == 8:
+            out_filename = input("\noutput filename > ")
+            with open(out_filename, "w") as out:
+                for m in molecules:
+                    write_standard_pdb(m, out)
+            print(f"wrote {n} frames to {out_filename}")
+        elif option == 9:
             return
+        else:
+            print("\nInvalid option!")
 
 
 def run_classic(filename: str) -> None:
