@@ -3084,6 +3084,33 @@ def rotation_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
     return Rz @ Ry @ Rx
 
 
+def classify_periodic_bonds(positions, bonds, pbc, tol: float = 1e-6):
+    """Split bonds into normal vs. periodic (wrapped across the cell).
+
+    Bonds are detected with the minimum-image convention, so a bond may connect
+    two atoms sitting on opposite faces of the cell. Drawing a straight line
+    between their real coordinates streaks across the whole structure; instead
+    such bonds should be drawn as stubs toward each atom's nearest periodic
+    image.
+
+    Returns ``(is_periodic, d_min)`` where ``is_periodic[k]`` is True when bond
+    ``k`` wraps, and ``d_min[k]`` is its minimum-image displacement
+    ``pos_j - pos_i`` (real space). With no PBC, all bonds are non-periodic.
+    """
+    n = len(bonds)
+    if n == 0:
+        return np.zeros(0, dtype=bool), np.zeros((0, 3))
+    n_atoms = len(positions)
+    bond_i = np.clip(np.array([b[0] for b in bonds]), 0, max(n_atoms - 1, 0))
+    bond_j = np.clip(np.array([b[1] for b in bonds]), 0, max(n_atoms - 1, 0))
+    d_raw = positions[bond_j] - positions[bond_i]
+    if pbc is None:
+        return np.zeros(n, dtype=bool), d_raw
+    d_min = pbc.wrap(d_raw)
+    is_periodic = np.linalg.norm(d_raw - d_min, axis=1) > tol
+    return is_periodic, d_min
+
+
 class ImageRenderer:
     def __init__(
         self,
@@ -3538,14 +3565,32 @@ class ImageRenderer:
                 atom_colors = [a.element.cpk_color for a in snap_atoms]
 
             if not vdw:
-                for i, j in snap_bonds:
+                # Periodic bonds connect atoms on opposite faces of the cell.
+                # Draw them as two short stubs (one from each atom toward its
+                # partner's nearest image) instead of a line straight across.
+                stub_view = None
+                is_periodic = None
+                if snap_bonds:
+                    is_periodic, d_min = classify_periodic_bonds(
+                        positions, snap_bonds, pbc
+                    )
+                    stub_view = (0.5 * d_min) @ rot.T  # half-bond, view space
+                for k, (i, j) in enumerate(snap_bonds):
                     if i >= n_snap or j >= n_snap:
                         continue  # skip bonds that reference atoms outside snapshot
                     c1, c2 = atom_colors[i], atom_colors[j]
                     if has_hl and i in hl and j in hl:
                         c1 = self._highlight_color()
                         c2 = self._highlight_color()
-                    self.render_bond(transformed[i], transformed[j], c1, c2)
+                    if is_periodic is not None and is_periodic[k]:
+                        self.render_bond(
+                            transformed[i], transformed[i] + stub_view[k], c1, c1
+                        )
+                        self.render_bond(
+                            transformed[j], transformed[j] - stub_view[k], c2, c2
+                        )
+                    else:
+                        self.render_bond(transformed[i], transformed[j], c1, c2)
 
             atom_order = sorted(
                 range(n_snap),
@@ -3563,7 +3608,8 @@ class ImageRenderer:
                 self.render_sphere(transformed[i], radius, color)
 
         # Draw 3D density blobs
-        if density_positions is not None and density_values is not None and len(density_positions) > 0:
+        if (density_positions is not None and density_values is not None
+                and len(density_positions) > 0):
             for di in range(len(density_positions)):
                 pos = rot @ (density_positions[di] - centroid)
                 pos[0] += pan[0]
@@ -3591,7 +3637,10 @@ class ImageRenderer:
                     continue
                 cutoff = atom.element.covalent_radius * 2.5 + 0.5
                 center_pos = atom.position
-                nbr_indices = []
+                # Collect neighbours at their minimum-image positions so a metal
+                # near a face gets a coherent polyhedron instead of edges
+                # streaking across the cell to the atoms' real coordinates.
+                nbr_view = []
                 for ni, natom in enumerate(snap_atoms):
                     if ni == ci:
                         continue
@@ -3602,19 +3651,19 @@ class ImageRenderer:
                         diff = frac @ pbc.basis_matrix
                     d = float(np.linalg.norm(diff))
                     if d < cutoff:
-                        nbr_indices.append(ni)
-                if len(nbr_indices) < 3:
+                        pt = rot @ (center_pos + diff - centroid)
+                        pt[0] += pan[0]
+                        pt[1] += pan[1]
+                        pt[2] += camera_distance
+                        nbr_view.append(pt)
+                if len(nbr_view) < 3:
                     continue
                 # Draw edges between all neighboring atoms (polyhedron wireframe)
                 color = atom.element.cpk_color
                 dim = (color[0] // 2, color[1] // 2, color[2] // 2)
-                for ai in range(len(nbr_indices)):
-                    for bi in range(ai + 1, len(nbr_indices)):
-                        self.render_bond(
-                            transformed[nbr_indices[ai]],
-                            transformed[nbr_indices[bi]],
-                            dim, dim,
-                        )
+                for ai in range(len(nbr_view)):
+                    for bj in range(ai + 1, len(nbr_view)):
+                        self.render_bond(nbr_view[ai], nbr_view[bj], dim, dim)
 
         # Draw axis arrows in bottom-left corner (always, including ribbon)
         if pbc is not None:
