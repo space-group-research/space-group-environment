@@ -42,10 +42,11 @@ from numpy import array, cos, floor, pi, sin, sqrt
 from dataclasses import dataclass, field
 from typing import Optional
 import copy
+import logging
 import re
 import sys
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import Callable, Optional, TextIO
 import struct
 from typing import BinaryIO, Optional
 from functools import reduce
@@ -54,6 +55,7 @@ from typing import Any, Iterator, TextIO
 import math
 from typing import Any
 from collections import Counter
+from typing import Optional, TextIO
 import json
 import urllib.parse
 import urllib.request
@@ -661,7 +663,16 @@ def get_forcefield(name: int) -> dict[str, dict[str, float]]:
     return ffs[name]
 
 
-def apply_ff_to_system(system: list, ff: dict[str, dict[str, float]]) -> list:
+def apply_ff_to_system_report(
+    system: list, ff: dict[str, dict[str, float]],
+) -> tuple[list, dict[str, int]]:
+    """Apply force-field parameters; return (system, {missing element: atom count}).
+
+    Atoms whose element is absent from the force field get all parameters set
+    to zero, as the original pdb_wizard did, and are counted in the returned
+    dict so the caller can warn the user instead of silently writing zeros.
+    """
+    missing: dict[str, int] = {}
     for atom in system:
         el = atom.element.symbol
         if el in ff:
@@ -672,7 +683,25 @@ def apply_ff_to_system(system: list, ff: dict[str, dict[str, float]]) -> list:
             atom.c6 = params["c6"]
             atom.c8 = params["c8"]
             atom.c10 = params["c10"]
+        else:
+            atom.alpha = atom.sigma = atom.epsilon = 0.0
+            atom.c6 = atom.c8 = atom.c10 = 0.0
+            missing[el] = missing.get(el, 0) + 1
+    return system, missing
+
+
+def apply_ff_to_system(system: list, ff: dict[str, dict[str, float]]) -> list:
+    system, _ = apply_ff_to_system_report(system, ff)
     return system
+
+
+def missing_ff_messages(missing: dict[str, int]) -> list[str]:
+    """Human-readable warnings for apply_ff_to_system_report's missing dict."""
+    return [
+        f"!!! {n} atom{'s' if n != 1 else ''} of element {el} not found in forcefield, "
+        f"parameters set to all zeros !!!"
+        for el, n in sorted(missing.items())
+    ]
 
 # ======================================================================
 # Module: molecule
@@ -996,6 +1025,8 @@ import io as _io
 import numpy as np
 
 
+_log = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Single-frame readers
 # ---------------------------------------------------------------------------
@@ -1006,74 +1037,292 @@ def _split_packed_floats(s: str) -> list[str]:
     return re.findall(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", s)
 
 
-def _parse_pdb_atom(line: str) -> Atom:
-    """Parse an ATOM/HETATM line.
+# An MPMC atom record carries x y z mass charge alpha epsilon sigma (and
+# optionally omega gwp_alpha c6 c8 c10) after the six leading fields, so it has
+# at least 14 whitespace tokens. A standard PDB line has at most 12 (record,
+# serial, name, resName, chainID, resSeq, x, y, z, occupancy, B-factor,
+# element, formal charge) and a pdb2pqr .pqr line 10-11.
+MPMC_MIN_TOKENS = 14
 
-    Handles three PDB variants:
-    1. Standard PDB: fixed-width columns (name 12:16, coords 30:38/38:46/46:54)
-    2. MPMC PDB: wider space-delimited fields (name tokens[2], coords tokens[6:9])
-    3. Overflow PDB: serial merges with record type, coords may be packed
 
-    Detection: if tokens[0] is longer than 6 chars (e.g. 'HETATM99999'), the
-    serial overflowed and token positions are shifted — use fixed-width + regex.
-    Otherwise use token-based parsing which works for both standard and MPMC.
+def _is_decimal(tok: str) -> bool:
+    if "." not in tok:
+        return False
+    try:
+        float(tok)
+        return True
+    except ValueError:
+        return False
+
+
+# PDB coordinates are %8.3f: when two overflow into each other the only
+# unambiguous way to split "-1234.5002345.250" is on exactly three decimals.
+_PDB_COORD_RE = re.compile(r"[+-]?\d+\.\d{3}")
+
+
+def _expand_numeric_tokens(tokens: list[str]) -> list[str]:
+    """Split tokens that pack several numbers together ('-1000.000-1000.000').
+
+    Packed tokens are split on the %8.3f pattern first (the only way packing
+    arises), then on a general float pattern. Non-numeric tokens are kept
+    as-is so a run of coordinates can still be located relative to them.
     """
-    tokens = line.split()
+    out: list[str] = []
+    for tok in tokens:
+        if _is_decimal(tok) or not any(ch.isdigit() for ch in tok):
+            out.append(tok)
+            continue
+        parts = _PDB_COORD_RE.findall(tok)
+        if len(parts) > 1 and "".join(parts) == tok:
+            out.extend(parts)
+            continue
+        parts = _split_packed_floats(tok)
+        if len(parts) > 1 and "".join(parts) == tok:
+            out.extend(parts)
+        else:
+            out.append(tok)
+    return out
 
-    if len(tokens[0]) > 6:
-        # Overflow: serial merged with record type, use fixed-width name + regex coords
-        name = line[12:16].strip()
-        floats = _split_packed_floats(line[30:])
-        return Atom(float(floats[0]), float(floats[1]), float(floats[2]), name)
 
-    # Token-based: works for both standard PDB and MPMC format
-    # Layout: [record, serial, name, resName, chainID, resSeq, x, y, z, ...]
-    # MPMC:   [... x, y, z, mass, charge, alpha, epsilon, sigma, ...]
+def _coords_from_tokens(tokens: list[str]) -> tuple[float, float, float, list[str]]:
+    """(x, y, z, tokens after z) from the first run of three decimal numbers
+    after the residue fields.
+
+    Used when fixed columns are not reliable: free-form spacing, or values too
+    wide for their 8-character field that ran into the neighbouring one.
+    Residue sequence numbers are integers, so requiring a decimal point skips
+    them.
+    """
+    toks = _expand_numeric_tokens(tokens[4:])
+    for i in range(len(toks) - 2):
+        if _is_decimal(toks[i]) and _is_decimal(toks[i + 1]) and _is_decimal(toks[i + 2]):
+            return float(toks[i]), float(toks[i + 1]), float(toks[i + 2]), toks[i + 3:]
+    raise ValueError("no x y z coordinates found")
+
+
+def _is_mpmc_record(tokens: list[str]) -> bool:
+    """MPMC atom record: 14+ tokens with x y z mass charge alpha epsilon sigma
+    all numeric. A standard PDB line with a segment ID, element and formal
+    charge can also reach 14 tokens, but its token 11 is the segment ID.
+    """
+    if len(tokens) < MPMC_MIN_TOKENS:
+        return False
+    try:
+        for tok in tokens[6:14]:
+            float(tok)
+    except ValueError:
+        return False
+    return True
+
+
+# Marker lines/fields that identify a whole file as MPMC format even when
+# some atom records are short (MPMC tolerates missing trailing columns).
+_MPMC_FILE_MARKERS = ("REMARK BOX BASIS",)
+_MPMC_FLAGS = ("F", "M", "A", "S", "T")  # frozen / movable / adiabatic / spectre / target
+
+
+def _file_is_mpmc(lines: list[str]) -> bool:
+    for line in lines:
+        if line.startswith(_MPMC_FILE_MARKERS):
+            return True
+        if line[:4] == "ATOM" or line[:6] == "HETATM":
+            tokens = line.split()
+            if len(tokens) > 5 and tokens[3] == "BOX" and tokens[4] in _MPMC_FLAGS:
+                return True
+            if _is_mpmc_record(tokens):
+                return True
+    return False
+
+
+def _parse_mpmc_atom(tokens: list[str]) -> Atom:
+    """MPMC dialect: whitespace tokens, free field widths.
+
+    Layout: ATOM serial name resName flag molID x y z mass charge alpha epsilon
+    sigma [omega gwp_alpha c6 c8 c10]. MPMC itself reads this with
+    ``sscanf("%s %s ...")``, so columns carry no meaning here.
+    """
     name = tokens[2]
-    x = float(tokens[6])
-    y = float(tokens[7])
-    z = float(tokens[8])
-    atom = Atom(x, y, z, name)
-    # Try to read MPMC extended columns
-    if len(tokens) > 10:
+    atom = Atom(float(tokens[6]), float(tokens[7]), float(tokens[8]), name)
+    try:
+        atom.charge = float(tokens[10])
+    except (ValueError, IndexError):
+        pass
+    try:
+        atom.alpha = float(tokens[11])
+        atom.epsilon = float(tokens[12])
+        atom.sigma = float(tokens[13])
+    except (ValueError, IndexError):
+        pass
+    if len(tokens) > 18:
         try:
-            atom.charge = float(tokens[10])
-        except (ValueError, IndexError):
-            pass
-    if len(tokens) > 13:
-        try:
-            atom.alpha = float(tokens[11])
-            atom.epsilon = float(tokens[12])
-            atom.sigma = float(tokens[13])
+            atom.c6 = float(tokens[16])
+            atom.c8 = float(tokens[17])
+            atom.c10 = float(tokens[18])
         except (ValueError, IndexError):
             pass
     return atom
 
 
-def read_pdb(file: TextIO, filename: str = "") -> tuple[list[Atom], Optional[PBC]]:
-    lines = file.readlines()
-    pbc = None
-    system: list[Atom] = []
+def _parse_formal_charge(field: str) -> Optional[float]:
+    """PDB columns 79-80: '2+', '1-' (or the lenient '+2' / '-1')."""
+    f = field.strip()
+    if len(f) != 2:
+        return None
+    if f[0].isdigit() and f[1] in "+-":
+        return float(f[0]) * (1.0 if f[1] == "+" else -1.0)
+    if f[1].isdigit() and f[0] in "+-":
+        return float(f[1]) * (1.0 if f[0] == "+" else -1.0)
+    return None
 
-    for line in lines:
+
+def _coordinate_columns_aligned(line: str) -> bool:
+    """True if the x/y/z fields (cols 31-54) are bounded by blanks.
+
+    A value too wide for its 8-character field runs into the neighbouring
+    column; the fixed-column slice would then still parse, but to a wrong
+    (truncated or sign-flipped) number. Column 30 is blank by specification
+    and column 55 is the first character of the occupancy field.
+    """
+    if len(line) > 29 and line[29] != " ":
+        return False
+    if len(line) > 54 and line[54] not in " \r\n":
+        return False
+    return True
+
+
+def _element_column(line: str) -> str:
+    """Element symbol from PDB columns 77-78, tolerating an off-by-one shift.
+
+    The symbol is right-justified in columns 77-78 (0-based 76:78), but many
+    writers put it one column early or late. Take the alphabetic run touching
+    those columns; give up (return '') if it is longer than two letters, which
+    means it merged with a segment identifier.
+    """
+    n = len(line)
+    for start in (76, 77, 75):
+        if start < n and line[start].isalpha():
+            left = start
+            while left > 72 and line[left - 1].isalpha():
+                left -= 1
+            right = start
+            while right + 1 < n and line[right + 1].isalpha():
+                right += 1
+            tok = line[left:right + 1]
+            return tok if len(tok) <= 2 else ""
+    return ""
+
+
+def _parse_standard_atom(line: str, tokens: list[str], pqr: bool = False) -> Atom:
+    """Standard PDB (fixed columns) or pdb2pqr .pqr dialect.
+
+    Coordinates come from columns 31-54 as the format specifies; a line whose
+    columns are misaligned falls back to the first run of three decimals.
+    The element column (77-78) overrides name-based inference, so 'CA' is an
+    alpha carbon and 'HO' a hydrogen, not calcium and holmium. The charge
+    comes from the formal-charge columns (79-80) or, for pdb2pqr files, from
+    the token after z — never from the B-factor.
+    """
+    name = line[12:16].strip() or tokens[2]
+    after_z: Optional[list[str]] = None
+    try:
+        if not _coordinate_columns_aligned(line):
+            raise ValueError("coordinate fields overflow their columns")
+        x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
+    except ValueError:
+        x, y, z, after_z = _coords_from_tokens(tokens)
+        name = tokens[2]
+    atom = Atom(x, y, z, name)
+
+    elem_col = _element_column(line)
+    if elem_col and not pqr:
+        if elem_col.upper() == "D":
+            elem_col = "H"  # deuterium: no separate entry in the element table
+        el = get_element(elem_col)
+        if el.symbol != "X":
+            atom._element = el
+
+    if pqr:
+        # pdb2pqr / APBS: ... x y z charge radius
+        if after_z is None:
+            try:
+                _, _, _, after_z = _coords_from_tokens(tokens)
+            except ValueError:
+                after_z = None
+        if after_z:
+            try:
+                atom.charge = float(after_z[0])
+            except ValueError:
+                pass
+    else:
+        fc = _parse_formal_charge(line[78:80])
+        if fc is not None:
+            atom.charge = fc
+    return atom
+
+
+def _parse_pdb_atom(line: str, pqr: bool = False, mpmc: bool = False) -> Atom:
+    """Parse an ATOM/HETATM line, detecting the dialect per line.
+
+    1. Serial overflow (``HETATM99999``): fixed-width name + regex coordinates.
+    2. MPMC (14+ numeric-tailed tokens, or ``mpmc=True`` because the file
+       carries MPMC markers): whitespace tokens, extended force-field columns.
+    3. Standard PDB / pdb2pqr: fixed columns with a token fallback.
+
+    ``pqr`` says the file has a .pqr suffix, which only matters for the
+    pdb2pqr charge/radius convention; MPMC files also use .pqr but are
+    recognised by their content.
+    """
+    tokens = line.split()
+
+    if len(tokens[0]) > 6:
+        name = line[12:16].strip()
+        nums = [t for t in _expand_numeric_tokens(line[30:].split()) if _is_decimal(t)]
+        if len(nums) < 3:
+            raise ValueError("no x y z coordinates found")
+        return Atom(float(nums[0]), float(nums[1]), float(nums[2]), name)
+
+    if mpmc or _is_mpmc_record(tokens):
+        return _parse_mpmc_atom(tokens)
+
+    return _parse_standard_atom(line, tokens, pqr=pqr)
+
+
+def read_pdb(file: TextIO, filename: str = "") -> tuple[list[Atom], Optional[PBC]]:
+    """Read atoms and cell from a PDB / MPMC PDB / pdb2pqr PQR file.
+
+    MPMC box-corner pseudo-atoms (element X in residue BOX) are dropped. Other
+    atoms with an unrecognised element are kept as element 'X' and reported
+    through the module logger, instead of vanishing silently.
+    """
+    system: list[Atom] = []
+    pbc: Optional[PBC] = None
+    pqr = filename.lower().endswith(".pqr")
+    unknown_names: dict[str, int] = {}
+    skipped: list[int] = []
+
+    lines = file.readlines()
+    # A file with MPMC markers (box corners, basis remarks, or any full MPMC
+    # record) is parsed as MPMC throughout, so short records that only carry
+    # mass and charge are not mistaken for standard PDB occupancy/B-factor.
+    mpmc_file = _file_is_mpmc(lines)
+    for lineno, line in enumerate(lines, 1):
         if len(line) < 4:
             continue
         # Fast record detection without full split
-        if line[0] == "A" and line[1:4] == "TOM":
+        is_atom = line[0] == "A" and line[1:4] == "TOM"
+        is_hetatm = line[0] == "H" and line[1:6] == "ETATM"
+        if is_atom or is_hetatm:
             try:
-                atom = _parse_pdb_atom(line)
-                if atom.atomic_number > 0:
-                    system.append(atom)
+                atom = _parse_pdb_atom(line, pqr=pqr, mpmc=mpmc_file)
             except (ValueError, IndexError):
-                pass
-            continue
-        if line[0] == "H" and line[1:6] == "ETATM":
-            try:
-                atom = _parse_pdb_atom(line)
-                if atom.atomic_number > 0:
-                    system.append(atom)
-            except (ValueError, IndexError):
-                pass
+                skipped.append(lineno)
+                continue
+            if atom.atomic_number == 0:
+                tokens = line.split()
+                if len(tokens) > 3 and tokens[3] == "BOX":
+                    continue  # MPMC box corner, not an atom
+                unknown_names[atom.name] = unknown_names.get(atom.name, 0) + 1
+            system.append(atom)
             continue
         if line[0] == "R" and line[:6] == "REMARK":
             tokens = line.split()
@@ -1100,7 +1349,26 @@ def read_pdb(file: TextIO, filename: str = "") -> tuple[list[Atom], Optional[PBC
             break
 
     set_atom_ids(system)
+    where = f" in {filename}" if filename else ""
+    if skipped:
+        shown = ", ".join(str(n) for n in skipped[:5])
+        more = f" (+{len(skipped) - 5} more)" if len(skipped) > 5 else ""
+        _log.warning(f"Skipped {len(skipped)} unparsable atom line(s){where}: {shown}{more}")
+    if unknown_names:
+        names = ", ".join(f"{n} x{c}" for n, c in sorted(unknown_names.items()))
+        _log.warning(f"Unrecognised element names{where} kept as 'X': {names}")
     return system, pbc
+
+
+def _xyz_atom(tokens: list[str]) -> Atom:
+    """Atom from an XYZ record; the symbol column may hold an atomic number."""
+    symbol = tokens[0]
+    if symbol.isdigit():
+        el = get_element_by_number(int(symbol))
+        atom = Atom(tokens[1], tokens[2], tokens[3], el.symbol)
+        atom._element = el
+        return atom
+    return Atom(tokens[1], tokens[2], tokens[3], symbol)
 
 
 def read_xyz(file: TextIO, filename: str = "") -> tuple[list[Atom], Optional[PBC]]:
@@ -1134,7 +1402,7 @@ def read_xyz(file: TextIO, filename: str = "") -> tuple[list[Atom], Optional[PBC
                 if not line:
                     break
                 tokens = line.split()
-                atom = Atom(tokens[1], tokens[2], tokens[3], tokens[0])
+                atom = _xyz_atom(tokens)
                 try:
                     atom.charge = float(tokens[4])
                 except (ValueError, IndexError):
@@ -1145,7 +1413,7 @@ def read_xyz(file: TextIO, filename: str = "") -> tuple[list[Atom], Optional[PBC
                 if line == "" or line == "\n":
                     continue
                 tokens = line.split()
-                atom = Atom(tokens[1], tokens[2], tokens[3], tokens[0])
+                atom = _xyz_atom(tokens)
                 try:
                     atom.charge = float(tokens[4])
                 except (ValueError, IndexError):
@@ -1729,12 +1997,29 @@ def write_xyz(mol: Molecule, out: TextIO | str) -> None:
             fh.close()
 
 
+class CellRequiredError(ValueError):
+    """Raised by writers for formats that cannot be written without a unit cell."""
+
+
+def require_cell(mol: Molecule, what: str) -> None:
+    if mol.pbc is None:
+        raise CellRequiredError(
+            f"{what} requires a unit cell (PBC); this structure has none. "
+            "Set one with Update Cell first."
+        )
+
+
 def write_standard_pdb(mol: Molecule, out: TextIO | str, skip_mols_step: bool = False) -> None:
+    """Write a standardized PDB (CRYST1, HETATM records, END).
+
+    With ``skip_mols_step`` the atoms are written in their current order and
+    positions; otherwise molecules are found, sorted, named and re-imaged whole.
+    A structure without a cell is written without a CRYST1 record (and without
+    molecule re-imaging) — a valid non-periodic PDB, as OpenMM NoCutoff setups
+    need. Earlier versions silently wrote nothing in that case.
+    """
     import copy
 
-
-    if mol.pbc is None:
-        return
 
     # Work on a copy so we don't reorder the caller's molecule
     mol = copy.deepcopy(mol)
@@ -1749,10 +2034,12 @@ def write_standard_pdb(mol: Molecule, out: TextIO | str, skip_mols_step: bool = 
     out.write("MODEL        1\n")
     out.write("COMPND    " + " " * 69 + "\n")
     out.write("AUTHOR    GENERATED BY PDB WIZARD\n")
-    out.write(
-        f"CRYST1  {round(pbc.a, 3):>7}  {round(pbc.b, 3):7}  {round(pbc.c, 3):7} "
-        f"{round(pbc.alpha, 2):>6} {round(pbc.beta, 2):>6} {round(pbc.gamma, 2):>6} P 1           1\n"
-    )
+    if pbc is not None:
+        out.write(
+            f"CRYST1  {round(pbc.a, 3):>7}  {round(pbc.b, 3):7}  {round(pbc.c, 3):7} "
+            f"{round(pbc.alpha, 2):>6} {round(pbc.beta, 2):>6} {round(pbc.gamma, 2):>6} "
+            "P 1           1\n"
+        )
 
     atom_id = 1
     lines: list[str] = []
@@ -1800,12 +2087,19 @@ def write_standard_pdb(mol: Molecule, out: TextIO | str, skip_mols_step: bool = 
 
         for atom in submol.atoms:
             atom.id = atom_id
-            dx = pbc.wrap(atom.x - base_atom.x)
-            atom.x = base_atom.x + dx
+            if not skip_mols_step and pbc is not None:
+                # Keep each molecule whole: image every atom next to its base atom.
+                dx = pbc.wrap(atom.x - base_atom.x)
+                atom.x = base_atom.x + dx
 
+            # Exact PDB columns: serial 7-11, name 13-16 (short names start at
+            # column 14), resName 18-20, chain 22, resSeq 23-26, x/y/z 31-54,
+            # occupancy 55-60, B-factor 61-66, element 77-78.
+            name = atom.name[:4]
+            name_field = f" {name:<3}" if len(name) < 4 else name
             lines.append(
-                f"HETATM {atom.id:>4}  {atom.name:<3} {mol_name:>3} A {idx + 1:>4}    "
-                f"{round(atom.x[0], 3):>7} {round(atom.x[1], 3):>7} {round(atom.x[2], 3):>7}"
+                f"HETATM{atom.id:>5} {name_field} {mol_name:>3} A{idx + 1:>4}    "
+                f"{atom.x[0]:8.3f}{atom.x[1]:8.3f}{atom.x[2]:8.3f}"
                 f"  1.00  0.00          {atom.element.symbol:>2}\n"
             )
             atom_id += 1
@@ -1824,11 +2118,20 @@ def write_mpmc_pdb(
     write_params: bool = False,
     sorbate_lines: list[str] | None = None,
 ) -> None:
+    """Write an MPMC-format PDB (what MPMC calls a .pqr).
+
+    Every atom record is written complete — mass, charge, alpha, epsilon,
+    sigma, c6, c8, c10 — using the values currently stored on the atoms, so the
+    file is always loadable by MPMC. ``write_charges`` / ``write_params`` are
+    kept for API compatibility and record whether the caller assigned charges /
+    force-field parameters; they do not change the record layout (the original
+    tool wrote ``xxxNAMExxx`` placeholders instead, which MPMC cannot read).
+    Raises CellRequiredError when ``mol.pbc`` is None.
+    """
     import copy
 
 
-    if mol.pbc is None:
-        return
+    require_cell(mol, "Writing an MPMC PDB")
 
     # Work on a copy so we don't reorder the caller's molecule
     mol = copy.deepcopy(mol)
@@ -1851,10 +2154,14 @@ def write_mpmc_pdb(
         for idx, atom in enumerate(mol.atoms):
             parts.append(
                 f"ATOM {idx + 1:>6} {atom.name:<4} MOF F    1    "
-                f"{round(atom.x[0], 3):>7} {round(atom.x[1], 3):>7} {round(atom.x[2], 3):>7}"
+                f"{atom.x[0]:7.3f} {atom.x[1]:7.3f} {atom.x[2]:7.3f}"
                 f" {atom.mass:>9.5f} {atom.charge:>9.5f}"
                 f" {atom.alpha:>9.5f} {atom.epsilon:>9.5f} {atom.sigma:>9.5f}"
-                f" 0.0 0.0 {atom.c6:>8.4} {atom.c8:>10.4} {atom.c10:>10.2}\n"
+                # omega and gwp_alpha (unused) then the PHAHST dispersion
+                # coefficients at full precision. The original wrote c10 with
+                # only two significant digits ({:>10.2}), e.g. 13951.5 -> 1.4e+04,
+                # which MPMC happily read as a 0.35% error.
+                f" 0.0 0.0 {atom.c6:>10.5f} {atom.c8:>11.4f} {atom.c10:>12.3f}\n"
             )
 
         next_atom_id = len(mol.atoms) + 1
@@ -1871,7 +2178,7 @@ def write_mpmc_pdb(
                 f"ATOM {next_atom_id + ind:>6} X    BOX F {box_mol_id:>4}    "
                 f"{round(pos[0], 3):>7} {round(pos[1], 3):>7} {round(pos[2], 3):>7} 0.0 0.0 0.0 0.0 0.0\n"
             )
-        parts.extend(f"CONECT {next_atom_id + i - 1:>4} {next_atom_id + j - 1:>4}\n"
+        parts.extend(f"CONECT {next_atom_id + i:>4} {next_atom_id + j:>4}\n"
                      for i, j in pbc.edges())
         parts.extend(f"REMARK BOX BASIS[{r_idx}]  {row[0]:20.14f} {row[1]:20.14f} {row[2]:20.14f}\n"
                      for r_idx, row in enumerate(pbc.basis_matrix))
@@ -1907,16 +2214,39 @@ def check_xyz_trajectory(filename: str) -> bool:
         return False
 
 
+def _is_atom_record(line: str) -> bool:
+    return line[:4] == "ATOM" or line[:6] == "HETATM"
+
+
+def _is_frame_end(line: str) -> bool:
+    """END / ENDMDL record (VMD and many converters separate frames with END)."""
+    rec = line[:6].rstrip()
+    return rec in ("END", "ENDMDL")
+
+
 def check_pdb_trajectory(filename: str) -> bool:
+    """True if the file holds more than one frame.
+
+    Frames may be introduced by ``MODEL`` or ``REMARK step=`` records, or
+    simply separated by ``END``/``ENDMDL`` with further ATOM records after it.
+    """
     try:
         with open(filename) as f:
             n_model = 0
             n_remark_step = 0
+            atoms_in_block = False
+            block_closed = False
             for line in f:
                 if line[:6] == "MODEL ":
                     n_model += 1
                 elif line.startswith("REMARK step="):
                     n_remark_step += 1
+                elif _is_atom_record(line):
+                    if block_closed:
+                        return True
+                    atoms_in_block = True
+                elif _is_frame_end(line) and atoms_in_block:
+                    block_closed = True
                 if n_model > 1 or n_remark_step > 1:
                     return True
         return False
@@ -1954,13 +2284,13 @@ def read_xyz_trajectory(
                 pbc = PBC(*[float(t) for t in tokens])
             except ValueError:
                 if default_pbc is None:
-                    default_pbc = PBC(1000000, 1000000, 1000000, 90, 90, 90)
+                    default_pbc = fallback_cell()
                 pbc = copy.deepcopy(default_pbc)
 
             for _ in range(n_atoms):
                 line = file.readline()
                 tokens = line.split()
-                atom = Atom(tokens[1], tokens[2], tokens[3], tokens[0])
+                atom = _xyz_atom(tokens)
                 try:
                     atom.charge = float(tokens[4])
                 except (ValueError, IndexError):
@@ -1986,7 +2316,34 @@ def _is_frame_boundary(line: str) -> bool:
     return line[:6] == "MODEL " or line.startswith("REMARK step=")
 
 
+# Edge length (Å) of the box assumed for trajectories that carry no cell. It is
+# large enough that minimum-image never wraps, i.e. the system is treated as
+# non-periodic. Callers should warn the user when they see it.
+NO_CELL_FALLBACK_LENGTH = 1000000.0
+
+
+def fallback_cell() -> PBC:
+    """A huge cubic box standing in for 'no cell' in trajectory frames."""
+    return PBC(NO_CELL_FALLBACK_LENGTH, NO_CELL_FALLBACK_LENGTH, NO_CELL_FALLBACK_LENGTH,
+               90.0, 90.0, 90.0)
+
+
+def is_fallback_cell(pbc: Optional[PBC]) -> bool:
+    """True if ``pbc`` is the stand-in box from fallback_cell()."""
+    if pbc is None:
+        return False
+    return (abs(pbc.a - NO_CELL_FALLBACK_LENGTH) < 1.0
+            and abs(pbc.b - NO_CELL_FALLBACK_LENGTH) < 1.0
+            and abs(pbc.c - NO_CELL_FALLBACK_LENGTH) < 1.0)
+
+
 def read_pdb_trajectory(file: TextIO, progress_callback=None) -> tuple[list[Molecule], list[Optional[PBC]]]:
+    """Read every frame of a multi-frame PDB/PQR.
+
+    Frames start at ``MODEL``/``REMARK step=`` records or after an
+    ``END``/``ENDMDL`` that closes a block of atoms. Frames without a cell get
+    the shared fallback_cell() so minimum-image code works (non-periodic).
+    """
     molecules: list[Molecule] = []
     pbcs: list[Optional[PBC]] = []
 
@@ -1994,35 +2351,39 @@ def read_pdb_trajectory(file: TextIO, progress_callback=None) -> tuple[list[Mole
     total_lines = len(all_lines)
 
     frame_lines: list[str] = []
-    for li, line in enumerate(all_lines):
-        if _is_frame_boundary(line) and len(frame_lines) > 3:
+    atoms_in_frame = 0
+
+    def _flush() -> None:
+        nonlocal frame_lines, atoms_in_frame
+        if atoms_in_frame > 0:
             buf = _io.StringIO("".join(frame_lines))
             system, pbc = read_pdb(buf)
             if system:
                 molecules.append(Molecule(atoms=system, pbc=pbc))
                 pbcs.append(pbc)
-            frame_lines = []
+        frame_lines = []
+        atoms_in_frame = 0
+
+    for li, line in enumerate(all_lines):
+        if _is_frame_boundary(line):
+            _flush()
             if progress_callback and li % 2000 == 0:
                 progress_callback(li / total_lines)
         frame_lines.append(line)
+        if _is_atom_record(line):
+            atoms_in_frame += 1
+        elif _is_frame_end(line):
+            _flush()
 
-    # Last frame
-    if len(frame_lines) > 3:
-        buf = _io.StringIO("".join(frame_lines))
-        system, pbc = read_pdb(buf)
-        if system:
-            molecules.append(Molecule(atoms=system, pbc=pbc))
-            pbcs.append(pbc)
+    _flush()  # last frame
 
     if progress_callback:
         progress_callback(1.0)
 
     for idx, pbc in enumerate(pbcs):
         if pbc is None:
-            if idx == 0:
-                pbcs[idx] = PBC(1000000, 1000000, 1000000, 90, 90, 90)
-            else:
-                pbcs[idx] = copy.copy(pbcs[0])
+            pbcs[idx] = fallback_cell() if idx == 0 else copy.copy(pbcs[0])
+            molecules[idx].pbc = pbcs[idx]
 
     return molecules, pbcs
 
@@ -2059,7 +2420,20 @@ def detect_filetype(filepath: str) -> str:
     raise ValueError(f"Unsupported file format: {suffix}")
 
 
-def read_file(filepath: str) -> Molecule:
+def read_file(
+    filepath: str,
+    remove_overlaps: bool = True,
+    on_message: Optional[Callable[[str], None]] = None,
+) -> Molecule:
+    """Read a single-structure file into a Molecule.
+
+    Like the original pdb_wizard, duplicate atoms sitting on top of each other
+    (closer than ``geometry.OVERLAP_CUTOFF`` Å under minimum image) are deleted
+    on load when the file carries a cell. Each deletion is reported through
+    ``on_message``; when no callback is given the messages go to the
+    ``pdb_wizard.io`` logger at WARNING level (stderr by default) so the
+    deletion is never silent. Pass ``remove_overlaps=False`` to keep every atom.
+    """
     ft = detect_filetype(filepath)
     if ft == "pdb":
         with open(filepath) as f:
@@ -2090,10 +2464,20 @@ def read_file(filepath: str) -> Molecule:
     elif ft == "mol2":
         with open(filepath) as f:
             system, pbc = read_mol2(f)
+    elif ft == "dcd":
+        raise ValueError(
+            "DCD files are trajectories; open them with read_file_trajectory "
+            "(or the TUI / --msd / --rdf)."
+        )
     else:
         raise ValueError(f"Unknown filetype: {ft}")
 
     mol = Molecule(atoms=system, pbc=pbc)
+    if remove_overlaps:
+        mol, messages = remove_overlapping_atoms(mol)
+        report = on_message if on_message is not None else _log.warning
+        for message in messages:
+            report(message)
     mol.detect_bonds()
     return mol
 
@@ -2443,31 +2827,86 @@ def check_dcd_trajectory(filepath: str) -> bool:
 import numpy as np
 
 
+# Two atoms closer than this (Å, minimum image) are treated as duplicates.
+OVERLAP_CUTOFF = 0.05
+# Upper bound on (rows x atoms) distance entries evaluated per chunk.
+_OVERLAP_CHUNK_BUDGET = 4_000_000
 
-def overlap_detector(mol: Molecule) -> Molecule:
-    if mol.pbc is None:
-        return mol
+
+def find_overlapping_pairs(
+    mol: Molecule, cutoff: float = OVERLAP_CUTOFF,
+) -> list[tuple[int, int]]:
+    """Return index pairs (i, j), i < j, of atoms within ``cutoff`` of each other.
+
+    Uses the minimum-image convention, so requires ``mol.pbc``. Pairs are
+    sorted by (i, j). Distances are evaluated in row chunks so the memory
+    footprint stays bounded for large frameworks.
+    """
     pbc = mol.pbc
+    n = len(mol.atoms)
+    if pbc is None or n < 2:
+        return []
+    coords = np.array([a.x for a in mol.atoms], dtype=float)
+    recip = pbc.reciprocal_basis_matrix
+    basis = pbc.basis_matrix
+    cut2 = cutoff * cutoff
+    # Keep each chunk's (chunk x n x 3) intermediates to a few million floats.
+    chunk = max(1, _OVERLAP_CHUNK_BUDGET // n)
+    pairs: list[tuple[int, int]] = []
+    for start in range(0, n, chunk):
+        stop = min(start + chunk, n)
+        dx = coords[start:stop, None, :] - coords[None, :, :]
+        frac = dx @ recip
+        wrapped = dx - np.round(frac) @ basis
+        r2 = np.einsum("ijk,ijk->ij", wrapped, wrapped)
+        ii, jj = np.nonzero(r2 < cut2)
+        ii = ii + start
+        keep = ii < jj
+        pairs.extend(zip(ii[keep].tolist(), jj[keep].tolist()))
+    return pairs
+
+
+def remove_overlapping_atoms(
+    mol: Molecule, cutoff: float = OVERLAP_CUTOFF,
+) -> tuple[Molecule, list[str]]:
+    """Delete duplicate atoms that sit on top of each other.
+
+    For each cluster of overlapping atoms the first one in file order is kept
+    and the later ones are removed, matching the behaviour of the original
+    pdb_wizard. Returns the molecule and one human-readable message per
+    deleted atom. Nothing is printed here; callers decide how to report.
+    """
+    if mol.pbc is None:
+        return mol, []
     system = mol.atoms
     set_atom_ids(system)
+    pairs = find_overlapping_pairs(mol, cutoff)
+    if not pairs:
+        return mol, []
+
+    removed: set[int] = set()
     messages: list[str] = []
-    overlapping = True
-    while overlapping:
-        overlapping = False
-        for atom in system:
-            for atom2 in system:
-                if atom.id != atom2.id and not overlapping:
-                    r = pbc.min_image(atom.x - atom2.x)
-                    if r < 0.05:
-                        overlapping = True
-                        messages.append(
-                            f"Deleting overlapping atoms "
-                            f"{atom.element.symbol:>3} {atom.id:>5} --- "
-                            f"{atom2.element.symbol:>3} {atom2.id:>5}"
-                        )
-                        system.remove(atom2)
-    set_atom_ids(system)
-    mol.atoms = system
+    for i, j in pairs:
+        if i in removed or j in removed:
+            continue
+        removed.add(j)
+        a, b = system[i], system[j]
+        messages.append(
+            f"Deleting overlapping atoms\n"
+            f"{a.element.symbol:>3} {a.id:>5} --- {b.element.symbol:>3} {b.id:>5}\n"
+            f" {a.x}\n {b.x}"
+        )
+
+    mol.atoms = [atom for k, atom in enumerate(system) if k not in removed]
+    set_atom_ids(mol.atoms)
+    return mol, messages
+
+
+def overlap_detector(mol: Molecule) -> Molecule:
+    """Classic-menu entry point: remove overlapping atoms and print what was deleted."""
+    mol, messages = remove_overlapping_atoms(mol)
+    for message in messages:
+        print(message)
     return mol
 
 
@@ -2597,10 +3036,16 @@ def get_lone_atoms(mol: Molecule) -> list[Atom]:
     return [system[i] for i in range(n) if not has_neighbor[i]]
 
 
-def delete_lone_atoms(mol: Molecule) -> Molecule:
-    lone = set(id(a) for a in get_lone_atoms(mol))
-    if not lone:
-        return mol
+def remove_lone_atoms(mol: Molecule) -> tuple[Molecule, list[Atom]]:
+    """Delete atoms with no vdW-contact neighbour; return (mol, deleted atoms).
+
+    Requires a cell: without ``mol.pbc`` nothing is removed and the returned
+    list is empty, so callers can distinguish "no lone atoms" from "no cell".
+    """
+    lone_atoms = get_lone_atoms(mol)
+    if not lone_atoms:
+        return mol, []
+    lone = set(id(a) for a in lone_atoms)
     keep = [i for i, a in enumerate(mol.atoms) if id(a) not in lone]
     keep_set = set(keep)
     old_to_new = {old: new for new, old in enumerate(keep)}
@@ -2610,12 +3055,26 @@ def delete_lone_atoms(mol: Molecule) -> Molecule:
         for a, b in mol.bonds if a in keep_set and b in keep_set
     ]
     set_atom_ids(mol.atoms)
+    return mol, lone_atoms
+
+
+def delete_lone_atoms(mol: Molecule) -> Molecule:
+    """Delete lone atoms, returning only the molecule (see remove_lone_atoms)."""
+    mol, _ = remove_lone_atoms(mol)
     return mol
 
 
-def edit_h_dist(mol: Molecule, second_element: str, distance: float) -> Molecule:
+def adjust_h_distances(
+    mol: Molecule, second_element: str, distance: float,
+) -> tuple[Molecule, list[str]]:
+    """Set every bonded ``second_element``-H distance to ``distance`` Å.
+
+    Returns the molecule and one message per adjusted pair, in the format the
+    original pdb_wizard printed (``"O-H       12    13"``). Requires a cell:
+    with ``mol.pbc`` None nothing is changed and no messages are returned.
+    """
     if mol.pbc is None:
-        return mol
+        return mol, []
     pbc = mol.pbc
     system = mol.atoms
     set_atom_ids(system)
@@ -2640,6 +3099,12 @@ def edit_h_dist(mol: Molecule, second_element: str, distance: float) -> Molecule
                     dx = pbc.wrap(dx)
                     dx *= distance / r
                     h_atom.x = other.x + dx
+    return mol, messages
+
+
+def edit_h_dist(mol: Molecule, second_element: str, distance: float) -> Molecule:
+    """Adjust X-H distances, returning only the molecule (see adjust_h_distances)."""
+    mol, _ = adjust_h_distances(mol, second_element, distance)
     return mol
 
 # ======================================================================
@@ -2743,6 +3208,9 @@ def extend_axis(mol: Molecule, axis: int, times: int) -> Molecule:
     params[axis] *= (times + 1)
     pbc.update(*params)
     set_atom_ids(mol.atoms)
+    # The cached bond list only covers the original atoms; drop it so the
+    # geometry listings recompute instead of showing a stale, short list.
+    mol.bonds = []
     return mol
 
 
@@ -6189,9 +6657,8 @@ def read_poscar(file: TextIO) -> tuple[list[Atom], Optional[PBC]]:
 
 
 def write_poscar(mol: Molecule, out: TextIO) -> None:
-    """Write VASP POSCAR format."""
-    if mol.pbc is None:
-        return
+    """Write VASP POSCAR format. Raises CellRequiredError without a cell."""
+    require_cell(mol, "Writing a POSCAR")
 
     from collections import OrderedDict
     species_counts: OrderedDict[str, int] = OrderedDict()
@@ -6318,9 +6785,8 @@ def read_lammps_data(file: TextIO) -> tuple[list[Atom], Optional[PBC]]:
 # ---------------------------------------------------------------------------
 
 def write_cif(mol: Molecule, out: TextIO) -> None:
-    """Write a CIF file from molecule with PBC."""
-    if mol.pbc is None:
-        return
+    """Write a CIF file. Raises CellRequiredError without a cell."""
+    require_cell(mol, "Writing a CIF")
 
     pbc = mol.pbc
     out.write("data_pdb_wizard\n")
@@ -9097,11 +9563,34 @@ class _AnalysisScreen(ModalScreen[None]):
         self._compute_task: asyncio.Task | None = None
 
     def _spawn_task(self, coro) -> asyncio.Task:
-        """Track the task so action_close can cancel it on dismiss."""
+        """Track the task so action_close can cancel it on dismiss.
+
+        A failure inside the task is reported in the screen's status label and
+        as a toast; without this an exception would only reach stderr at
+        garbage-collection time and the status would stay at "Computing...".
+        """
         if self._compute_task is not None and not self._compute_task.done():
             self._compute_task.cancel()
+        label = _task_label(coro)
         self._compute_task = asyncio.create_task(coro)
+        self._compute_task.add_done_callback(
+            lambda t, label=label: self._on_compute_done(t, label)
+        )
         return self._compute_task
+
+    def _on_compute_done(self, task: asyncio.Task, label: str) -> None:
+        exc = _task_failure(task)
+        if exc is None:
+            return
+        msg = f"{label} failed: {exc}"
+        try:
+            self.query_one(f"#{self._prefix}-status", Label).update(f"Error: {exc}")
+        except Exception:
+            pass
+        try:
+            self.app.notify(msg, timeout=6, severity="error")
+        except Exception:
+            pass
 
     def _get_frame_slice(self) -> list:
         """Get frame range from Start/End SpinBoxes if present."""
@@ -9142,10 +9631,26 @@ class _AnalysisScreen(ModalScreen[None]):
         """Write CSV with header and parallel arrays."""
         if not filepath.strip():
             return
-        with open(filepath.strip(), "w") as f:
-            f.write(header + "\n")
-            for row in zip(*arrays):
-                f.write(",".join(f"{v:.6f}" for v in row) + "\n")
+        path = filepath.strip()
+        try:
+            with open(path, "w") as f:
+                f.write(header + "\n")
+                for row in zip(*arrays):
+                    f.write(",".join(f"{v:.6f}" for v in row) + "\n")
+        except OSError as e:
+            # Raised inside a modal dismiss callback: an uncaught error here
+            # would take down the whole app.
+            self._safe_notify(f"Could not write {path}: {e}", severity="error")
+            return
+        self._safe_notify(f"Wrote {path}")
+
+    def _safe_notify(self, message: str, severity: str = "information") -> None:
+        """notify() via the app, tolerating a screen that is not mounted."""
+        try:
+            self.app.notify(message, timeout=6 if severity == "error" else 3,
+                            severity=severity)
+        except Exception:
+            pass
 
     def action_close(self) -> None:
         if self._compute_task is not None and not self._compute_task.done():
@@ -9311,19 +9816,21 @@ class RdfScreen(_AnalysisScreen):
         status.update(f"Computing g(r) {label1}-{label2}... 0%")
         await asyncio.sleep(0)
 
-        if use_traj:
-            frames_slice = self._frames[start_frame:end_frame]
-            r, g = await asyncio.to_thread(
-                self._rdf_filtered_traj_frames, frames_slice, filter1, filter2, _prog, x_max, n_bins,
-            )
-            title = f"g(r) {label1}-{label2} (frames {start_frame+1}-{end_frame})"
-        else:
-            r, g = await asyncio.to_thread(
-                self._rdf_filtered, self._molecule, filter1, filter2, _prog, x_max, n_bins,
-            )
-            title = f"g(r) {label1}-{label2}"
-
-        poll_timer.stop()
+        try:
+            if use_traj:
+                frames_slice = self._frames[start_frame:end_frame]
+                r, g = await asyncio.to_thread(
+                    self._rdf_filtered_traj_frames, frames_slice, filter1, filter2, _prog,
+                    x_max, n_bins,
+                )
+                title = f"g(r) {label1}-{label2} (frames {start_frame+1}-{end_frame})"
+            else:
+                r, g = await asyncio.to_thread(
+                    self._rdf_filtered, self._molecule, filter1, filter2, _prog, x_max, n_bins,
+                )
+                title = f"g(r) {label1}-{label2}"
+        finally:
+            poll_timer.stop()
 
         if len(r) == 0:
             status.update(f"No {label1}-{label2} pairs found")
@@ -10429,8 +10936,25 @@ class DatabaseSearchScreen(ModalScreen[None]):
     def _spawn_task(self, coro) -> asyncio.Task:
         if self._compute_task is not None and not self._compute_task.done():
             self._compute_task.cancel()
+        label = _task_label(coro)
         self._compute_task = asyncio.create_task(coro)
+        self._compute_task.add_done_callback(
+            lambda t, label=label: self._on_compute_done(t, label)
+        )
         return self._compute_task
+
+    def _on_compute_done(self, task: asyncio.Task, label: str) -> None:
+        exc = _task_failure(task)
+        if exc is None:
+            return
+        try:
+            self.query_one("#db-status", Label).update(f"Error: {exc}")
+        except Exception:
+            pass
+        try:
+            self.app.notify(f"{label} failed: {exc}", timeout=6, severity="error")
+        except Exception:
+            pass
 
     def _modes_for(self, source: str) -> tuple[str, ...]:
         if source == "all":
@@ -10651,11 +11175,13 @@ class DatabaseSearchScreen(ModalScreen[None]):
             cache_dir = self.app._db_cache_dir()
             path = await asyncio.to_thread(spec["fetch"], rid, cache_dir)
             # Parsing a large CIF is the synchronous slow part — offload it.
-            mol = await asyncio.to_thread(read_file, path)
+            load_msgs: list[str] = []
+            mol = await asyncio.to_thread(read_file, path, True, load_msgs.append)
             self.app.open_in_new_tab(mol, path)
             self.app.notify(
                 f"Opened {label} {rid} ({len(mol.atoms)} atoms)", timeout=3,
             )
+            self.app.notify_overlaps_removed(load_msgs)
             self.dismiss(None)  # auto-close on success
         except Exception as e:
             status.update(f"Error: {e}")
@@ -10790,14 +11316,20 @@ class EnergyPlotScreen(_AnalysisScreen):
         if not filepath.strip():
             return
         sl = self._step_slice()
-        with open(filepath.strip(), "w") as f:
-            cols = list(self._data.keys())
-            f.write(",".join(cols) + "\n")
-            for i in range(sl.start, sl.stop):
-                row = ",".join(f"{self._data[c][i]:.6f}" for c in cols)
-                f.write(row + "\n")
+        path = filepath.strip()
+        try:
+            with open(path, "w") as f:
+                cols = list(self._data.keys())
+                f.write(",".join(cols) + "\n")
+                for i in range(sl.start, sl.stop):
+                    row = ",".join(f"{self._data[c][i]:.6f}" for c in cols)
+                    f.write(row + "\n")
+        except OSError as e:
+            self.query_one("#energy-status", Label).update(f"Error: {e}")
+            self.app.notify(f"Could not write {path}: {e}", timeout=6, severity="error")
+            return
         self.query_one("#energy-status", Label).update(
-            f"Exported steps {sl.start + 1}-{sl.stop} to {filepath.strip()}"
+            f"Exported steps {sl.start + 1}-{sl.stop} to {path}"
         )
 
 
@@ -10960,12 +11492,13 @@ class PxrdScreen(_AnalysisScreen):
         ))
         await asyncio.sleep(0)
 
-        tt, intensity = await asyncio.to_thread(
-            compute_pxrd, self._molecule, wavelength=wl,
-            two_theta_max=tt_max, peak_width=width, progress_callback=_prog,
-        )
-
-        poll.stop()
+        try:
+            tt, intensity = await asyncio.to_thread(
+                compute_pxrd, self._molecule, wavelength=wl,
+                two_theta_max=tt_max, peak_width=width, progress_callback=_prog,
+            )
+        finally:
+            poll.stop()
 
         if len(tt) == 0:
             status.update("No reflections found")
@@ -11445,6 +11978,29 @@ class MoleculeView(Widget):
         self._cached_strips = strips
 
 
+def _task_label(coro) -> str:
+    """Human-readable name for a coroutine, e.g. '_do_wrap_async' -> 'wrap'."""
+    name = getattr(coro, "__name__", None) or "task"
+    for prefix in ("_do_", "_calc_", "_compute_", "_run_", "_load_", "_export_", "_"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    for suffix in ("_async",):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    return name.replace("_", " ") or "task"
+
+
+def _task_failure(task: asyncio.Task) -> BaseException | None:
+    """Return the exception a finished task raised, or None (also for cancels)."""
+    if task.cancelled():
+        return None
+    try:
+        return task.exception()
+    except asyncio.CancelledError:
+        return None
+
+
 def _find_nonoverlap_position(mol: Molecule) -> np.ndarray:
     """Find a position inside the unit cell that maximizes minimum distance to MOF atoms.
 
@@ -11898,8 +12454,11 @@ class PdbWizardApp(App):
     ]
 
     def __init__(self, molecule: Molecule, filepath: str = "", frames: list | None = None,
-                 load_trajectory: bool = False):
+                 load_trajectory: bool = False, load_messages: list[str] | None = None):
         super().__init__()
+        # Messages produced while reading the startup file (e.g. overlapping
+        # atoms deleted by read_file). Shown as a toast once the UI is mounted.
+        self._startup_load_messages: list[str] = list(load_messages or [])
         # Tab system
         self._tabs: list[TabState] = [TabState(molecule, filepath, frames)]
         self._active_tab = 0
@@ -11925,12 +12484,48 @@ class PdbWizardApp(App):
         # fetch; removed on app teardown.
         self._db_cache_dir_path: str | None = None
 
+    def notify_overlaps_removed(self, messages: list[str]) -> None:
+        """Toast a summary of atoms deleted by read_file's overlap check.
+
+        The classic menu prints each deletion; in the TUI stdout is not
+        visible, so the user must be told here or the atoms vanish silently.
+        """
+        n = len(messages)
+        if n == 0:
+            return
+        plural = "s" if n != 1 else ""
+        self.notify(
+            f"Deleted {n} overlapping atom{plural} (closer than {OVERLAP_CUTOFF} Å)",
+            timeout=6, severity="warning",
+        )
+
     def _track_task(self, coro) -> asyncio.Task:
-        """Create an asyncio task and track it for cleanup."""
+        """Create an asyncio task and track it for cleanup.
+
+        A failure inside the task is surfaced as an error toast and the busy
+        progress bar is cleared. Otherwise the exception would only be printed
+        to stderr at garbage-collection time ("Task exception was never
+        retrieved") and the status bar would stay stuck on "...".
+        """
+        label = _task_label(coro)
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+        task.add_done_callback(lambda t, label=label: self._on_tracked_task_done(t, label))
         return task
+
+    def _on_tracked_task_done(self, task: asyncio.Task, label: str) -> None:
+        exc = _task_failure(task)
+        if exc is None:
+            return
+        try:
+            self._hide_progress()
+        except Exception:
+            pass
+        try:
+            self.notify(f"{label} failed: {exc}", timeout=6, severity="error")
+        except Exception:
+            pass
 
     def _db_cache_dir(self) -> str:
         """Return a single per-session directory for downloaded structures.
@@ -12116,19 +12711,24 @@ class PdbWizardApp(App):
             callback=self._open_new_tab,
         )
 
+    @staticmethod
+    def _is_trajectory_file(filepath: str) -> bool:
+        """True for multi-frame PDB/XYZ files and readable DCD files."""
+        ft = detect_filetype(filepath)
+        if ft == "pdb":
+            return check_pdb_trajectory(filepath)
+        if ft == "xyz":
+            return check_xyz_trajectory(filepath)
+        if ft == "dcd":
+            return check_dcd_trajectory(filepath)
+        return False
+
     def _open_new_tab(self, filepath: str) -> None:
         if not filepath.strip():
             return
         filepath = filepath.strip()
         try:
-            ft = detect_filetype(filepath)
-            is_traj = False
-            if ft == "pdb":
-                is_traj = check_pdb_trajectory(filepath)
-            elif ft == "xyz":
-                is_traj = check_xyz_trajectory(filepath)
-            elif ft == "dcd":
-                is_traj = check_dcd_trajectory(filepath)
+            is_traj = self._is_trajectory_file(filepath)
 
             if is_traj:
                 # Load trajectory in background into a new tab
@@ -12141,9 +12741,11 @@ class PdbWizardApp(App):
                 self.notify(f"Loading {new_tab.name}...", timeout=2)
                 self._track_task(self._load_traj_into_tab(filepath, len(self._tabs) - 1))
             else:
-                mol = read_file(filepath)
+                load_msgs: list[str] = []
+                mol = read_file(filepath, on_message=load_msgs.append)
                 self.open_in_new_tab(mol, filepath)
                 self.notify(f"Opened {self._tabs[-1].name}", timeout=2)
+                self.notify_overlaps_removed(load_msgs)
         except Exception as e:
             self.notify(f"Error: {e}", timeout=3)
 
@@ -12179,18 +12781,12 @@ class PdbWizardApp(App):
                     mols, _ = read_xyz_trajectory(f, progress_callback=_prog)
             return mols
 
-        frames = await asyncio.to_thread(_read)
-        timer.stop()
+        try:
+            frames = await asyncio.to_thread(_read)
+        finally:
+            timer.stop()
 
-        # If DCD loaded without a topology file, atoms are all carbon —
-        # surface that to the user.
-        if frames and getattr(frames[0], "_dcd_topology_missing", False):
-            self.notify(
-                "DCD has no element info. All atoms loaded as carbon. "
-                "Place a sibling .pdb or .xyz with the same atom count "
-                "next to the .dcd file.",
-                severity="warning", timeout=8,
-            )
+        self._warn_trajectory_caveats(frames)
 
         self.query_one("#status-label", Label).update("Detecting bonds...")
         self._update_progress(85)
@@ -12207,9 +12803,12 @@ class PdbWizardApp(App):
 
         self._hide_progress()
 
-        # Switch to the newly loaded tab
+        # Switch to the newly loaded tab. When loading into the already-active
+        # (empty) tab, saving the current state first would clobber the frames
+        # we just stored with the view's stale None.
         if tab_idx < len(self._tabs):
-            self._save_current_tab_state()
+            if tab_idx != self._active_tab:
+                self._save_current_tab_state()
             self._restore_tab_state(tab_idx)
         self.notify(f"Loaded {len(frames)} frames", timeout=2)
 
@@ -12289,6 +12888,10 @@ class PdbWizardApp(App):
             self._hide_progress()
             self._setup_traj_bar()
 
+        if self._startup_load_messages:
+            self.notify_overlaps_removed(self._startup_load_messages)
+            self._startup_load_messages = []
+
     async def _load_trajectory_async(self) -> None:
 
         self._show_progress("Loading trajectory...", total=100)
@@ -12304,6 +12907,9 @@ class PdbWizardApp(App):
             )
 
         def _read():
+            if ft == "dcd":
+                mols, _ = read_dcd_trajectory(self.filepath, progress_callback=_prog)
+                return mols
             with open(self.filepath) as f:
                 if ft == "pdb":
                     mols, _ = read_pdb_trajectory(f, progress_callback=_prog)
@@ -12312,6 +12918,7 @@ class PdbWizardApp(App):
             return mols
 
         frames = await asyncio.to_thread(_read)
+        self._warn_trajectory_caveats(frames)
 
         self.query_one("#status-label", Label).update("Detecting bonds...")
         self._update_progress(85)
@@ -12339,6 +12946,28 @@ class PdbWizardApp(App):
         self._hide_progress()
         self._update_title()
         self._setup_traj_bar()
+
+    def _warn_trajectory_caveats(self, frames: list | None) -> None:
+        """Toast anything the trajectory reader had to assume or fake."""
+        if not frames:
+            return
+        first = frames[0]
+        # DCD without a topology file: every atom is a carbon placeholder.
+        if getattr(first, "_dcd_topology_missing", False):
+            self.notify(
+                "DCD has no element info. All atoms loaded as carbon. "
+                "Place a sibling .pdb or .xyz with the same atom count "
+                "next to the .dcd file.",
+                severity="warning", timeout=8,
+            )
+        # No cell in the file: the reader substituted a huge non-periodic box.
+        if is_fallback_cell(first.pbc):
+            self.notify(
+                f"Trajectory has no cell information; assuming a "
+                f"{NO_CELL_FALLBACK_LENGTH:.0f} Å box (non-periodic). "
+                "Use Update Cell if the system is periodic.",
+                severity="warning", timeout=8,
+            )
 
     def _setup_traj_bar(self) -> None:
         traj_bar = self.query_one("#traj-bar")
@@ -13353,6 +13982,7 @@ class PdbWizardApp(App):
             import numpy as np
             parts = value.strip().split()
             x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+            self._save_undo()
             self.molecule.atoms[idx].x = np.array([x, y, z])
             self._track_task(self._refresh_molecule(f"Updated atom {idx + 1} position"))
         except (ValueError, IndexError):
@@ -13519,6 +14149,8 @@ class PdbWizardApp(App):
             return
 
         elif cmd == "wrap_center":
+            if not self._require_cell("Wrapping atoms"):
+                return
             self.push_screen(
                 ConfirmModal(
                     "Wrap Atoms (centered)",
@@ -13530,6 +14162,8 @@ class PdbWizardApp(App):
             return
 
         elif cmd == "wrap_forward":
+            if not self._require_cell("Wrapping atoms"):
+                return
             self.push_screen(
                 ConfirmModal(
                     "Wrap Atoms (forward)",
@@ -13541,6 +14175,8 @@ class PdbWizardApp(App):
             return
 
         elif cmd == "sort":
+            if not self._require_cell("Sorting atoms into molecules"):
+                return
             self.push_screen(
                 ConfirmModal(
                     "Sort Atoms",
@@ -13553,6 +14189,8 @@ class PdbWizardApp(App):
             return
 
         elif cmd == "del_lone":
+            if not self._require_cell("Finding lone atoms"):
+                return
             self.push_screen(
                 ConfirmModal(
                     "Delete Lone Atoms",
@@ -13564,6 +14202,8 @@ class PdbWizardApp(App):
             return
 
         elif cmd == "extend":
+            if not self._require_cell("Extending the cell"):
+                return
             self.push_screen(
                 ExtendAxisModal(mol.pbc),
                 callback=self._do_extend,
@@ -13571,6 +14211,8 @@ class PdbWizardApp(App):
             return
 
         elif cmd == "edit_h":
+            if not self._require_cell("Editing H distances"):
+                return
             self.push_screen(
                 InputModal(
                     "Edit H bond distances:",
@@ -13629,12 +14271,16 @@ class PdbWizardApp(App):
             return
 
         elif cmd == "write_cif":
+            if not self._require_cell("Writing a CIF"):
+                return
             stem = Path(self.filepath).stem
             default = str(Path(self.filepath).parent / f"{stem}_out.cif")
             self.push_screen(FileSaveModal("Save CIF as:", default=default), callback=self._do_write_cif)
             return
 
         elif cmd == "write_poscar":
+            if not self._require_cell("Writing a POSCAR"):
+                return
             stem = Path(self.filepath).stem
             default = str(Path(self.filepath).parent / "POSCAR")
             self.push_screen(FileSaveModal("Save POSCAR as:", default=default), callback=self._do_write_poscar)
@@ -13670,6 +14316,11 @@ class PdbWizardApp(App):
             return
 
         elif cmd == "write_mpmc":
+            if not self._require_cell("Writing an MPMC PDB"):
+                return
+            # The wizard mutates charges and force-field parameters on the
+            # live molecule, so make the whole export undoable in one step.
+            self._save_undo()
             self._mpmc_state = {"write_charges": False, "write_ff": False}
             # Check if atoms already have charges
             has_charges = any(abs(a.charge) > 1e-10 for a in mol.atoms)
@@ -13696,6 +14347,49 @@ class PdbWizardApp(App):
             return
 
         view._invalidate_cache()
+
+    def _require_cell(self, what: str) -> bool:
+        """Toast and return False when the active molecule has no unit cell.
+
+        Core operations such as wrap/extend/sort and the PDB/CIF/POSCAR/MPMC
+        writers are no-ops without a cell; guarding here keeps the TUI from
+        reporting success for something that did nothing.
+        """
+        if self.molecule.pbc is not None:
+            return True
+        self.notify(
+            f"{what} needs a unit cell (PBC). This structure has none — "
+            "set one with Edit > Update Cell first.",
+            timeout=5, severity="warning",
+        )
+        return False
+
+    def _discard_last_undo(self) -> None:
+        """Drop the most recent undo entry (an operation turned out to be a no-op)."""
+        if self._undo_stack:
+            self._undo_stack.pop()
+
+    def _write_text_file(self, filepath: str, writer, what: str) -> bool:
+        """Render with ``writer(handle)`` into memory, then write the file.
+
+        Buffering means a writer that raises (e.g. CellRequiredError) never
+        leaves a truncated or empty file behind. Returns True on success.
+        """
+        import io as _io_mod
+        buf = _io_mod.StringIO()
+        try:
+            writer(buf)
+        except ValueError as e:
+            self.notify(f"{what} failed: {e}", timeout=6, severity="error")
+            return False
+        try:
+            with open(filepath, "w") as f:
+                f.write(buf.getvalue())
+        except OSError as e:
+            self.notify(f"Error: {e}", timeout=4, severity="error")
+            return False
+        self.notify(f"Wrote {filepath}", timeout=3)
+        return True
 
     async def _refresh_molecule(self, msg: str = "") -> None:
         """Redetect bonds and refresh the view and geometry panel."""
@@ -13765,12 +14459,16 @@ class PdbWizardApp(App):
 
     async def _do_del_lone_async(self) -> None:
         self._save_undo()
-        before = len(self.molecule.atoms)
         self._show_progress("Finding lone atoms...")
         await asyncio.sleep(0)
-        await asyncio.to_thread(delete_lone_atoms, self.molecule)
-        after = len(self.molecule.atoms)
-        await self._refresh_molecule(f"Deleted {before - after} lone atoms")
+        _, deleted = await asyncio.to_thread(remove_lone_atoms, self.molecule)
+        if not deleted:
+            self._discard_last_undo()
+            self._hide_progress()
+            self.notify("No lone atoms found", timeout=3)
+            return
+        n = len(deleted)
+        await self._refresh_molecule(f"Deleted {n} lone atom{'s' if n != 1 else ''}")
 
     def _do_open_file(self, value: str | None) -> None:
         """Callback for the File > Open... picker."""
@@ -13781,7 +14479,18 @@ class PdbWizardApp(App):
         # tab instead of opening a new one — avoids a leftover blank tab.
         if not self.molecule.atoms and not self.filepath:
             try:
-                mol = read_file(filepath)
+                if self._is_trajectory_file(filepath):
+                    # Same background path as "open in new tab", but into the
+                    # empty active tab so no blank tab is left behind.
+                    tab = self._tabs[self._active_tab]
+                    tab.filepath = filepath
+                    self.filepath = filepath
+                    self._refresh_tab_bar()
+                    self.notify(f"Loading {Path(filepath).name}...", timeout=2)
+                    self._track_task(self._load_traj_into_tab(filepath, self._active_tab))
+                    return
+                load_msgs: list[str] = []
+                mol = read_file(filepath, on_message=load_msgs.append)
                 self.molecule = mol
                 self.filepath = filepath
                 self._tabs[self._active_tab].molecule = mol
@@ -13794,6 +14503,7 @@ class PdbWizardApp(App):
                 self._update_title()
                 self._refresh_tab_bar()
                 self.notify(f"Opened {Path(filepath).name}", timeout=2)
+                self.notify_overlaps_removed(load_msgs)
             except Exception as e:
                 self.notify(f"Error opening file: {e}", timeout=4, severity="error")
             return
@@ -13861,12 +14571,9 @@ class PdbWizardApp(App):
         self._confirm_overwrite(value.strip(), self._write_pdb_file)
 
     def _write_pdb_file(self, filepath: str) -> None:
-        try:
-            with open(filepath, "w") as f:
-                write_standard_pdb(self.molecule, f)
-            self.notify(f"Wrote {filepath}", timeout=3)
-        except OSError as e:
-            self.notify(f"Error: {e}", timeout=3)
+        self._write_text_file(
+            filepath, lambda f: write_standard_pdb(self.molecule, f), "Writing PDB",
+        )
 
     def _do_write_cif(self, value: str) -> None:
         if not value.strip():
@@ -13874,12 +14581,7 @@ class PdbWizardApp(App):
         self._confirm_overwrite(value.strip(), self._write_cif_file)
 
     def _write_cif_file(self, filepath: str) -> None:
-        try:
-            with open(filepath, "w") as f:
-                write_cif(self.molecule, f)
-            self.notify(f"Wrote {filepath}", timeout=3)
-        except OSError as e:
-            self.notify(f"Error: {e}", timeout=3)
+        self._write_text_file(filepath, lambda f: write_cif(self.molecule, f), "Writing CIF")
 
     def _do_write_poscar(self, value: str) -> None:
         if not value.strip():
@@ -13887,12 +14589,9 @@ class PdbWizardApp(App):
         self._confirm_overwrite(value.strip(), self._write_poscar_file)
 
     def _write_poscar_file(self, filepath: str) -> None:
-        try:
-            with open(filepath, "w") as f:
-                write_poscar(self.molecule, f)
-            self.notify(f"Wrote {filepath}", timeout=3)
-        except OSError as e:
-            self.notify(f"Error: {e}", timeout=3)
+        self._write_text_file(
+            filepath, lambda f: write_poscar(self.molecule, f), "Writing POSCAR",
+        )
 
     def _do_write_lammps(self, value: str) -> None:
         if not value.strip():
@@ -13900,12 +14599,9 @@ class PdbWizardApp(App):
         self._confirm_overwrite(value.strip(), self._write_lammps_file)
 
     def _write_lammps_file(self, filepath: str) -> None:
-        try:
-            with open(filepath, "w") as f:
-                write_lammps_data(self.molecule, f)
-            self.notify(f"Wrote {filepath}", timeout=3)
-        except OSError as e:
-            self.notify(f"Error: {e}", timeout=3)
+        self._write_text_file(
+            filepath, lambda f: write_lammps_data(self.molecule, f), "Writing LAMMPS data",
+        )
 
     def _apply_reduced_cell(self, result: Molecule | None) -> None:
         if result is None:
@@ -13940,14 +14636,14 @@ class PdbWizardApp(App):
                 atom.name = new_elem.symbol
                 count += 1
         if count == 0:
+            self._discard_last_undo()
             self.notify(f"No {old_el} atoms found", timeout=2)
             return
-        view = self.query_one(MoleculeView)
-        view.set_molecule(self.molecule, keep_camera=True)
-        view._invalidate_cache()
-        panel = self.query_one(GeometryPanel)
-        panel.set_molecule(self.molecule)
-        self.notify(f"Substituted {count} {old_el} -> {new_el}", timeout=3)
+        # Bond radii changed with the element: re-detect bonds and rebuild
+        # the geometry tables like every other mutating operation does.
+        self._track_task(
+            self._refresh_molecule(f"Substituted {count} {old_el} -> {new_el}")
+        )
 
     def _do_edit_h(self, value: str) -> None:
         if not value.strip():
@@ -13964,8 +14660,18 @@ class PdbWizardApp(App):
         self._save_undo()
         self._show_progress(f"Editing {element}-H distances...")
         await asyncio.sleep(0)
-        await asyncio.to_thread(edit_h_dist, self.molecule, element, distance)
-        await self._refresh_molecule(f"Set {element}-H distances to {distance} A")
+        _, messages = await asyncio.to_thread(
+            adjust_h_distances, self.molecule, element, distance,
+        )
+        if not messages:
+            self._discard_last_undo()
+            self._hide_progress()
+            self.notify(f"No bonded {element}-H pairs found; nothing changed", timeout=4)
+            return
+        n = len(messages)
+        await self._refresh_molecule(
+            f"Set {n} {element}-H distance{'s' if n != 1 else ''} to {distance} A"
+        )
 
     def _do_qeq_charges(self, confirmed: bool) -> None:
         if not confirmed:
@@ -13974,6 +14680,7 @@ class PdbWizardApp(App):
 
     async def _do_qeq_async(self) -> None:
         mol = self.molecule
+        self._save_undo()
         self._show_progress("Computing QEq charges...", total=100)
         await asyncio.sleep(0)
 
@@ -14033,10 +14740,12 @@ class PdbWizardApp(App):
         timer = self.set_interval(0.1, lambda: self._update_progress(int(_prog[0] * 100)))
         await asyncio.sleep(0)
 
-        positions, densities, pbc = await asyncio.to_thread(
-            compute_density_3d, self._frames, element, n_bins=15, progress_callback=_cb,
-        )
-        timer.stop()
+        try:
+            positions, densities, pbc = await asyncio.to_thread(
+                compute_density_3d, self._frames, element, n_bins=15, progress_callback=_cb,
+            )
+        finally:
+            timer.stop()
         self._hide_progress()
 
         if len(positions) == 0:
@@ -14178,6 +14887,7 @@ class PdbWizardApp(App):
             if self.molecule.pbc is None:
                 self.notify("This system already has no PBC", timeout=2)
                 return
+            self._save_undo()
             self.molecule.pbc = None
             self._track_task(self._refresh_molecule("PBC removed"))
             return
@@ -14185,6 +14895,7 @@ class PdbWizardApp(App):
             parts = value.strip().split()
             a, b, c = float(parts[0]), float(parts[1]), float(parts[2])
             alpha, beta, gamma = float(parts[3]), float(parts[4]), float(parts[5])
+            self._save_undo()
             if self.molecule.pbc is not None:
                 self.molecule.pbc.update(a, b, c, alpha, beta, gamma)
             else:
@@ -14203,9 +14914,9 @@ class PdbWizardApp(App):
             self._mpmc_state["write_charges"] = True
             self._mpmc_step_ask_ff()
         else:
-            # Zero out charges first
-            for a in self.molecule.atoms:
-                a.charge = 0.0
+            # Existing charges stay until a new source actually succeeds, so
+            # cancelling the next step doesn't leave the system with all-zero
+            # charges. Both the file loader and QEq overwrite every atom.
             self._mpmc_step_charge_source()
 
     def _mpmc_step_charge_source(self) -> None:
@@ -14300,9 +15011,11 @@ class PdbWizardApp(App):
         else:
             ff_map = {"OPLSAA": 0, "PHAHST": 1}
             ff_idx = ff_map.get(ff_name, 0)
-            apply_ff_to_system(self.molecule.atoms, get_forcefield(ff_idx))
+            _, missing = apply_ff_to_system_report(self.molecule.atoms, get_forcefield(ff_idx))
             label = ["OPLS-AA/UFF", "PHAHST"][ff_idx]
             self.notify(f"Applied {label} force field", timeout=2)
+            for msg in missing_ff_messages(missing):
+                self.notify(msg.strip("! "), timeout=8, severity="warning")
         self._mpmc_step_sorbate()
 
     def _mpmc_step_sorbate(self) -> None:
@@ -14344,16 +15057,16 @@ class PdbWizardApp(App):
                 mol_id=2, start_atom_id=n_atoms + 1,
             )
 
-        try:
-            write_mpmc_pdb(
-                self.molecule, filepath,
+        self._write_text_file(
+            filepath,
+            lambda f: write_mpmc_pdb(
+                self.molecule, f,
                 write_charges=self._mpmc_state["write_charges"],
                 write_params=self._mpmc_state["write_ff"],
                 sorbate_lines=sorbate_lines,
-            )
-            self.notify(f"Wrote {filepath}", timeout=3)
-        except OSError as e:
-            self.notify(f"Error: {e}", timeout=3)
+            ),
+            "Writing MPMC PDB",
+        )
 
 # ======================================================================
 # Module: menu
@@ -14512,16 +15225,25 @@ def _write_mpmc_options(mol: Molecule) -> None:
                     "valid answers are 'OPLSAA' (0) or 'PHAHST' (1)\n\n> "
                 )
                 ff_map = {"OPLSAA": 0, "PHAHST": 1}
-                ff_idx = ff_map.get(ff_in, int(ff_in))
+                key = ff_in.strip().upper()
+                if key in ff_map:
+                    ff_idx = ff_map[key]
+                elif key.isdigit():
+                    ff_idx = int(key)
+                else:
+                    raise ValueError
                 if ff_idx not in (0, 1):
                     raise ValueError
-                apply_ff_to_system(mol.atoms, get_forcefield(ff_idx))
+                _, missing = apply_ff_to_system_report(mol.atoms, get_forcefield(ff_idx))
+                for msg in missing_ff_messages(missing):
+                    print(msg)
                 break
             except ValueError:
                 print("!!! Error reading input !!!")
 
     filename = input("\noutput filename > ")
     write_mpmc_pdb(mol, filename, write_charges=write_charges, write_params=write_ff)
+    print(f"\nwrote {filename}\n")
 
 
 def _menu_geom_analysis(mol: Molecule) -> Molecule:
@@ -14563,13 +15285,36 @@ def _menu_geom_analysis(mol: Molecule) -> Molecule:
                 for atom in lone:
                     print(f"{atom.element.symbol:>3} {atom.id:>5} {atom.x}")
         elif option == 5:
-            mol = delete_lone_atoms(mol)
+            mol, deleted = remove_lone_atoms(mol)
+            if not deleted:
+                print("\nNo lone atoms found\n")
+            else:
+                print("\nDeleting lone atoms:\n")
+                for atom in deleted:
+                    print(f"{atom.element.symbol:>3} {atom.id:>5} {atom.x}")
         elif option == 6:
             _list_coords(mol)
         elif option == 7:
-            el = input("\nLook for hydrogens bonded with which element?\n\n> ")
-            dist = float(input(f"\nWhat distance shall {el}-H bonds be set to?\n\n> "))
-            mol = edit_h_dist(mol, el, dist)
+            while True:
+                try:
+                    el = input(
+                        "\nLook for hydrogens bonded with which element? "
+                        "(e.g. C, O, N, etc)\n\n> "
+                    ).strip()
+                    if not el or get_element(el).symbol == "X":
+                        raise ValueError
+                    el = get_element(el).symbol
+                    dist = float(input(
+                        f"\nWhat distance (in angstroms) shall {el}-H bonds be set to?\n\n> "
+                    ))
+                    break
+                except ValueError:
+                    print("!!! Error finding element or reading distance !!!")
+            mol, messages = adjust_h_distances(mol, el, dist)
+            if not messages:
+                print(f"\nNo {el}-H bonds found\n")
+            for msg in messages:
+                print(msg)
         elif option == 8:
             _vmd_preview(mol)
         elif option == 9:
@@ -14611,6 +15356,7 @@ def _main_loop_single(mol: Molecule, filename: str) -> None:
         elif option == 5:
             if mol.pbc is not None:
                 mol.pbc = _menu_update_pbc(mol.pbc)
+                mol.bonds = []  # bonds depend on the cell; recompute lazily
         elif option == 6:
             out_filename = input("\noutput filename > ")
             with open(out_filename, "w") as out:
@@ -14678,6 +15424,7 @@ def _main_loop_movie(molecules: list[Molecule], filename: str) -> None:
                 for m in molecules:
                     if m.pbc is not None:
                         m.pbc.update(*vals)
+                        m.bonds = []
                 print(f"\nUpdated cell dimensions in all {n} frames")
         elif option == 6:
             out_filename = input("\noutput filename > ")
@@ -14794,12 +15541,32 @@ def _check_file(filepath: str) -> None:
         sys.exit(1)
 
 
+def _read_or_exit(filepath: str):
+    """read_file with a clean one-line error instead of a traceback."""
+    try:
+        return read_file(filepath)
+    except (ValueError, OSError) as e:
+        print(f"Error: could not read {filepath}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def _batch_info(filepath: str) -> None:
     """Print system info and exit."""
 
     _check_file(filepath)
-    mol = read_file(filepath)
+    mol = _read_or_exit(filepath)
     print_info(mol, filepath)
+
+
+def _warn_fallback_cell(frames) -> None:
+    """Tell the user when a trajectory carried no cell (a huge box was assumed)."""
+    if frames and is_fallback_cell(frames[0].pbc):
+        print(
+            f"Warning: trajectory has no cell information; assuming a "
+            f"{NO_CELL_FALLBACK_LENGTH:.0f} A cubic box (non-periodic). "
+            "Periodic quantities such as g(r) normalisation will be meaningless.",
+            file=sys.stderr,
+        )
 
 
 def _batch_rdf(filepath: str, element1: str, element2: str, csv_path: str | None) -> None:
@@ -14807,10 +15574,11 @@ def _batch_rdf(filepath: str, element1: str, element2: str, csv_path: str | None
     _check_file(filepath)
 
     frames = read_file_trajectory(filepath)
+    _warn_fallback_cell(frames)
     if frames is not None:
         r, g = compute_rdf_trajectory(frames, element1, element2)
     else:
-        mol = read_file(filepath)
+        mol = _read_or_exit(filepath)
         r, g = compute_rdf(mol, element1, element2)
 
     if len(r) == 0:
@@ -14837,6 +15605,7 @@ def _batch_msd(filepath: str, element: str | None, csv_path: str | None) -> None
         print("MSD requires a trajectory file with multiple frames.",
               file=sys.stderr)
         sys.exit(1)
+    _warn_fallback_cell(frames)
 
     lags, msd = compute_msd(frames, element=element)
 
@@ -14854,29 +15623,57 @@ def _batch_msd(filepath: str, element: str | None, csv_path: str | None) -> None
             print(f"{li:.0f}  {mi:.6f}")
 
 
+# Formats whose writers cannot work without a unit cell. A standard PDB can be
+# written without CRYST1, so .pdb/.ent are not listed.
+_CELL_REQUIRED_SUFFIXES = (".pqr", ".cif", ".vasp", ".poscar")
+
+
 def _batch_convert(filepath: str, output: str) -> None:
-    """Convert between molecular file formats."""
+    """Convert between molecular file formats.
+
+    ``.pdb``/``.ent`` write a standardized PDB; ``.pqr`` writes an MPMC-format
+    PDB (charges and force-field columns preserved); ``.xyz``, ``.cif``,
+    ``.vasp``/``.poscar`` and LAMMPS data are also supported. Formats that
+    need a unit cell refuse to write when the structure has none, instead of
+    leaving an empty file behind.
+    """
     _check_file(filepath)
     from pathlib import Path
 
 
-    mol = read_file(filepath)
     suffix = Path(output).suffix.lower()
+    supported = (".xyz", ".pdb", ".ent", ".lmp", ".lammps", ".data") + _CELL_REQUIRED_SUFFIXES
+    if suffix not in supported:
+        print(f"Unsupported output format: {suffix}", file=sys.stderr)
+        sys.exit(1)
 
-    with open(output, "w") as out:
-        if suffix == ".xyz":
-            write_xyz(mol, out)
-        elif suffix in (".pdb", ".ent", ".pqr"):
-            write_standard_pdb(mol, out, skip_mols_step=True)
-        elif suffix == ".cif":
-            write_cif(mol, out)
-        elif suffix in (".vasp", ".poscar"):
-            write_poscar(mol, out)
-        elif suffix in (".lmp", ".lammps", ".data"):
-            write_lammps_data(mol, out)
-        else:
-            print(f"Unsupported output format: {suffix}", file=sys.stderr)
-            sys.exit(1)
+    mol = _read_or_exit(filepath)
+
+    if suffix in _CELL_REQUIRED_SUFFIXES and mol.pbc is None:
+        print(
+            f"Error: {suffix} output requires a unit cell, but {filepath} has none. "
+            "Convert to .xyz or add a cell to the input first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if os.path.exists(output):
+        print(f"Warning: overwriting existing file {output}", file=sys.stderr)
+
+    if suffix == ".pqr":
+        write_mpmc_pdb(mol, output)
+    else:
+        with open(output, "w") as out:
+            if suffix == ".xyz":
+                write_xyz(mol, out)
+            elif suffix in (".pdb", ".ent"):
+                write_standard_pdb(mol, out, skip_mols_step=True)
+            elif suffix == ".cif":
+                write_cif(mol, out)
+            elif suffix in (".vasp", ".poscar"):
+                write_poscar(mol, out)
+            else:
+                write_lammps_data(mol, out)
 
     print(f"Converted {filepath} -> {output}")
 
@@ -14885,7 +15682,7 @@ def _batch_surface(filepath: str) -> None:
     """Compute and print surface area."""
     _check_file(filepath)
 
-    mol = read_file(filepath)
+    mol = _read_or_exit(filepath)
     result = surface_area(mol)
     print(f"Surface area: {result['surface_area']:.2f} A^2")
     print(f"Area per volume: {result['area_per_volume']:.2f} m^2/g")
@@ -14895,7 +15692,7 @@ def _batch_psd(filepath: str) -> None:
     """Compute and print pore size distribution."""
     _check_file(filepath)
 
-    mol = read_file(filepath)
+    mol = _read_or_exit(filepath)
     centers, hist = pore_size_distribution(mol)
 
     if hist.sum() == 0:
@@ -14946,7 +15743,8 @@ def main() -> None:
     )
     batch.add_argument(
         "--convert", action="store_true",
-        help="convert file to another format (requires -o for output path)",
+        help="convert file to another format (requires -o for output path; "
+             ".pqr output is MPMC format)",
     )
     batch.add_argument(
         "--surface", action="store_true",
@@ -15030,20 +15828,34 @@ def main() -> None:
             empty = Molecule(atoms=[])
             app = PdbWizardApp(molecule=empty, filepath="")
         else:
-            ft = detect_filetype(args.file)
+            if not os.path.exists(args.file):
+                parser.error(f"file not found: {args.file}")
+            try:
+                ft = detect_filetype(args.file)
+            except ValueError as e:
+                parser.error(str(e))
             is_traj = False
             if ft == "pdb":
                 is_traj = check_pdb_trajectory(args.file)
             elif ft == "xyz":
                 is_traj = check_xyz_trajectory(args.file)
+            elif ft == "dcd":
+                is_traj = check_dcd_trajectory(args.file)
+                if not is_traj:
+                    parser.error(f"{args.file} is not a readable DCD trajectory")
 
             if is_traj:
                 # Launch app empty, load trajectory in background
                 empty = Molecule(atoms=[])
                 app = PdbWizardApp(molecule=empty, filepath=args.file, load_trajectory=True)
             else:
-                molecule = read_file(args.file)
-                app = PdbWizardApp(molecule=molecule, filepath=args.file)
+                load_messages: list = []
+                try:
+                    molecule = read_file(args.file, on_message=load_messages.append)
+                except (ValueError, OSError) as e:
+                    parser.error(f"could not read {args.file}: {e}")
+                app = PdbWizardApp(molecule=molecule, filepath=args.file,
+                                   load_messages=load_messages)
         app.run()
 
 
