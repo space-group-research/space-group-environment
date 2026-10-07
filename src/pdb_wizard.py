@@ -454,6 +454,33 @@ class PBC:
         self.gamma = gamma
         self._compute_matrices()
 
+    def perpendicular_widths(self) -> np.ndarray:
+        """Distance between each pair of opposite cell faces (Å), for a, b, c.
+
+        Half the smallest of these is the largest cutoff for which the
+        rounding minimum image (used here and in MPMC) finds every pair.
+        For a skewed cell it is shorter than min(a, b, c) / 2.
+        """
+        m = self.basis_matrix
+        areas = np.array([
+            np.linalg.norm(np.cross(m[1], m[2])),
+            np.linalg.norm(np.cross(m[2], m[0])),
+            np.linalg.norm(np.cross(m[0], m[1])),
+        ])
+        return abs(self.volume) / areas
+
+    def shortest_lattice_vector(self, max_coef: int = 5) -> float:
+        """Length of the shortest nonzero lattice vector (Å).
+
+        Mirrors MPMC's pbc_cutoff() (src/energy/pbc.c, MAX_VECT_COEF = 5):
+        when mpmc.inp has no pbc_cutoff, MPMC uses half of this value.
+        """
+        r = np.arange(-max_coef, max_coef + 1)
+        coefs = np.array(np.meshgrid(r, r, r, indexing="ij")).reshape(3, -1).T
+        coefs = coefs[np.any(coefs != 0, axis=1)]
+        vecs = coefs @ self.basis_matrix
+        return float(np.sqrt((vecs * vecs).sum(axis=1)).min())
+
     def min_image(self, dx: np.ndarray) -> float:
         img = np.matmul(dx, self.reciprocal_basis_matrix)
         img = np.round(img)
@@ -5721,7 +5748,8 @@ template engine; this module supplies the per-pressure derived variables
 import numpy as np
 
 
-# Default MPMC LJ cutoff in Å. The simulation needs min(a,b,c)/2 > this.
+# LJ cutoff (Å) the box is checked against. Minimum image needs half the
+# smallest perpendicular cell width to be at least this.
 _DEFAULT_LJ_CUTOFF = 10.0
 # A charge is "set" if |q| exceeds this — anything smaller is rounding noise.
 _CHARGE_NONZERO = 1e-9
@@ -5749,9 +5777,12 @@ def validate_for_mpmc(
 
     Warnings:
       - |net charge| > 1e-3 e (non-neutral box)
-      - min(a,b,c)/2 < lj_cutoff (box too small for default LJ cutoff)
+      - Half the smallest perpendicular width < lj_cutoff (cell too thin)
+      - MPMC's automatic cutoff exceeds the minimum-image limit (skewed cell)
       - Sorbate placement overlaps a framework atom (within 1.5 Å)
-      - Triclinic cell (α/β/γ deviates from 90° — abcbasis loses info)
+
+    Triclinic cells need no warning: 'abcbasis a b c α β γ' builds the same
+    basis (a along x, b in the xy plane) as PBC._compute_matrices.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -5799,24 +5830,30 @@ def validate_for_mpmc(
             f"Some elements are likely missing from the chosen force field."
         )
 
-    # Box size vs LJ cutoff
+    # Box size vs LJ cutoff. Minimum image is only exact up to half the
+    # smallest perpendicular width, which for a skewed cell is less than
+    # min(a, b, c) / 2.
     pbc = mol.pbc
-    half_min = min(pbc.a, pbc.b, pbc.c) / 2.0
-    if half_min < lj_cutoff:
+    max_cutoff = float(pbc.perpendicular_widths().min()) / 2.0
+    if max_cutoff < lj_cutoff:
         warnings.append(
-            f"Smallest box half-length is {half_min:.2f} Å but MPMC's default "
-            f"LJ cutoff is {lj_cutoff:.1f} Å. Either build a supercell "
-            f"(Edit > Extend Axis) or reduce the cutoff in mpmc.inp."
+            f"Cell is too thin for a {lj_cutoff:.1f} Å cutoff: half the "
+            f"smallest perpendicular width is {max_cutoff:.2f} Å. Either build "
+            f"a supercell (Edit > Extend Axis) or set pbc_cutoff ≤ "
+            f"{max_cutoff:.2f} in mpmc.inp."
         )
 
-    # Triclinic cell
-    if (abs(pbc.alpha - 90.0) > 0.5
-            or abs(pbc.beta - 90.0) > 0.5
-            or abs(pbc.gamma - 90.0) > 0.5):
+    # Without pbc_cutoff, MPMC uses half the shortest lattice vector, which
+    # exceeds the minimum-image limit in any non-orthogonal cell. Only pairs
+    # in the shell between the two radii are affected, so stay quiet for
+    # mild skew (<5%); a hexagonal cell (γ = 120°) is ~15% over.
+    mpmc_auto = pbc.shortest_lattice_vector() / 2.0
+    if mpmc_auto > 1.05 * max_cutoff:
         warnings.append(
-            f"Cell is not orthorhombic (α={pbc.alpha:.2f}, β={pbc.beta:.2f}, "
-            f"γ={pbc.gamma:.2f}). 'abcbasis' in mpmc.inp loses skew "
-            f"information; use 'pbc_input' with the basis matrix instead."
+            f"Cell is skewed: MPMC's automatic cutoff ({mpmc_auto:.2f} Å, half "
+            f"the shortest lattice vector) is larger than the minimum-image "
+            f"limit ({max_cutoff:.2f} Å), so some pairs would be missed. Set "
+            f"pbc_cutoff ≤ {max_cutoff:.2f} in mpmc.inp."
         )
 
     # Sorbate placement overlap
@@ -8986,7 +9023,8 @@ class SpinBox(Widget, can_focus=True):
 
 
 class ExtendAxisModal(ModalScreen[tuple]):
-    """Modal to extend all three axes at once. Returns (na, nb, nc) multipliers."""
+    """Modal to extend all three axes at once. Returns (na, nb, nc), the number
+    of extra copies per axis, matching the classic menu's "How many times"."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("q", "cancel", "Close")]
     DEFAULT_CSS = """
@@ -9051,16 +9089,16 @@ class ExtendAxisModal(ModalScreen[tuple]):
             yield Label("Extend Supercell", classes="title")
             if sub:
                 yield Label(sub)
-            yield Label("Multipliers (final cell = original x multiplier):")
+            yield Label("Times to extend each axis (1 doubles it, as in the classic menu):")
             with Horizontal(classes="axis-row"):
                 yield Label("a:", classes="axis-label")
-                yield SpinBox(value=1, min_val=1, max_val=20, id="extend-na")
+                yield SpinBox(value=0, min_val=0, max_val=19, id="extend-na")
             with Horizontal(classes="axis-row"):
                 yield Label("b:", classes="axis-label")
-                yield SpinBox(value=1, min_val=1, max_val=20, id="extend-nb")
+                yield SpinBox(value=0, min_val=0, max_val=19, id="extend-nb")
             with Horizontal(classes="axis-row"):
                 yield Label("c:", classes="axis-label")
-                yield SpinBox(value=1, min_val=1, max_val=20, id="extend-nc")
+                yield SpinBox(value=0, min_val=0, max_val=19, id="extend-nc")
             with Horizontal():
                 yield Button("Extend", id="extend-ok", variant="primary")
                 yield Button("Cancel", id="extend-cancel")
@@ -14514,29 +14552,31 @@ class PdbWizardApp(App):
         if not value or len(value) != 3:
             return
         na, nb, nc = value
-        if na == 1 and nb == 1 and nc == 1:
+        if na == 0 and nb == 0 and nc == 0:
             return  # no-op
         self._track_task(self._do_extend_async(na, nb, nc))
 
     async def _do_extend_async(self, na: int, nb: int, nc: int) -> None:
+        """Add na, nb, nc extra copies along a, b, c (classic-menu counting)."""
+        size = f"{na + 1}x{nb + 1}x{nc + 1}"
         self._save_undo()
-        self._show_progress(f"Extending {na}x{nb}x{nc}...")
+        self._show_progress(f"Extending to {size}...")
         await asyncio.sleep(0)
 
         def _extend_all(mol):
             # All three axes inside one thread — main loop only sees the
             # final state, never the intermediate (renderer doesn't render
             # the partial 2x1x1 / 2x2x1 frames).
-            if na > 1:
-                extend_axis(mol, 0, na - 1)
-            if nb > 1:
-                extend_axis(mol, 1, nb - 1)
-            if nc > 1:
-                extend_axis(mol, 2, nc - 1)
+            if na > 0:
+                extend_axis(mol, 0, na)
+            if nb > 0:
+                extend_axis(mol, 1, nb)
+            if nc > 0:
+                extend_axis(mol, 2, nc)
             return mol
 
         await asyncio.to_thread(_extend_all, self.molecule)
-        await self._refresh_molecule(f"Extended to {na}x{nb}x{nc}")
+        await self._refresh_molecule(f"Extended to {size}")
 
     def _confirm_overwrite(self, filepath: str, callback) -> None:
         """If filepath exists, prompt to overwrite. Otherwise call callback directly."""
