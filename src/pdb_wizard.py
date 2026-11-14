@@ -21421,6 +21421,24 @@ else:  # keeps the module (and the single-file build) importable without Qt
     _QWidget = _QMainWindow = _QTableModel = object
 
 GUI_INSTALL_HINT = 'The desktop GUI needs PySide6:  pip install "pdb-wizard[gui]"'
+GUI_BROKEN_QT_HINT = (
+    "This PySide6 release is broken on this Python version: every Qt call that returns "
+    "nothing loses a reference to None, and Python stops with 'Fatal Python error: "
+    "none_dealloc' while the window is drawing (seen with PySide6 6.12.0 on Python 3.10).\n"
+    'Install a working release:  pip install "PySide6!=6.12.0"   (or use Python 3.12+)'
+)
+
+
+def qt_loses_none_references(calls: int = 64) -> bool:
+    """True when this Qt binding drops a reference to None on each call of a method that
+    returns nothing. Python 3.12+ cannot be hurt by it (None is immortal there)."""
+    if not _HAS_QT or sys.version_info >= (3, 12):
+        return False
+    probe = QtCore.QObject()
+    before = sys.getrefcount(None)
+    for _ in range(calls):
+        probe.setObjectName("probe")
+    return before - sys.getrefcount(None) >= calls // 2
 
 # writers by output suffix; MPMC's dialect is .pqr
 _WRITERS = {
@@ -23773,6 +23791,9 @@ def run_gui(path: Optional[str] = None) -> int:
     """Open the desktop window (blocking). Returns the exit code."""
     if not _HAS_QT:
         print(GUI_INSTALL_HINT)
+        return 1
+    if qt_loses_none_references():
+        print(GUI_BROKEN_QT_HINT)
         return 1
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(["pdb_wizard"])
     app.setApplicationName("PDB Wizard")
